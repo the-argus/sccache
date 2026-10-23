@@ -13,7 +13,7 @@
 // limitations under the License.
 #[cfg(feature = "dist-client")]
 pub use self::client::{Client, request_dist_control};
-pub use self::common::SetMaxJobsLocalHttpRequest;
+pub use self::common::{SetMaxJobsLocalHttpRequest, SetMaxMemoryLocalHttpRequest};
 #[cfg(feature = "dist-server")]
 pub use self::server::Server;
 #[cfg(feature = "dist-server")]
@@ -94,6 +94,14 @@ mod common {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    pub struct AllocJobHttpRequest {
+        pub toolchain: dist::Toolchain,
+        pub command_hash: dist::CommandHash,
+        pub client_name: String,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub enum AllocJobHttpResponse {
         Success {
             job_alloc: dist::JobAlloc,
@@ -167,6 +175,13 @@ mod common {
                 .finish()
         }
     }
+    #[cfg(feature = "dist-server")]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CompleteJobHttpRequest {
+        pub peak_memory: Option<u64>,
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct RunJobHttpRequest {
@@ -178,6 +193,13 @@ mod common {
     #[serde(deny_unknown_fields)]
     pub struct SetMaxJobsLocalHttpRequest {
         pub max_jobs: usize,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SetMaxMemoryLocalHttpRequest {
+        #[serde(deserialize_with = "Option::deserialize")]
+        pub max_memory: Option<u64>,
     }
 }
 
@@ -210,6 +232,11 @@ pub mod urls {
         scheduler_url
             .join(&format!("/api/v1/scheduler/job_state/{}", job_id))
             .expect("failed to create job state url")
+    }
+    pub fn scheduler_complete_job(scheduler_url: &reqwest::Url, job_id: JobId) -> reqwest::Url {
+        scheduler_url
+            .join(&format!("/api/v1/scheduler/job_complete/{}", job_id))
+            .expect("failed to create job complete url")
     }
     pub fn scheduler_status(scheduler_url: &reqwest::Url) -> reqwest::Url {
         scheduler_url
@@ -253,6 +280,10 @@ pub mod urls {
         let url = format!("http://{}/api/v1/control/max_jobs", dist_control_address);
         reqwest::Url::parse(&url).unwrap()
     }
+    pub fn dist_control_max_memory(dist_control_address: SocketAddr) -> reqwest::Url {
+        let url = format!("http://{}/api/v1/control/max_memory", dist_control_address);
+        reqwest::Url::parse(&url).unwrap()
+    }
 }
 
 #[cfg(feature = "dist-server")]
@@ -274,14 +305,16 @@ mod server {
     use std::time::Duration;
 
     use super::common::{
-        AllocJobHttpResponse, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
-        RunJobHttpRequest, ServerCertificateHttpResponse, SetMaxJobsLocalHttpRequest,
+        AllocJobHttpRequest, AllocJobHttpResponse, CompleteJobHttpRequest,
+        HeartbeatServerHttpRequest, ReqwestRequestBuilderExt, RunJobHttpRequest,
+        ServerCertificateHttpResponse, SetMaxJobsLocalHttpRequest, SetMaxMemoryLocalHttpRequest,
     };
     use super::urls;
     use crate::dist::{
-        self, AllocJobResult, AssignJobResult, BuilderInfo, HeartbeatServerResult, InputsReader,
-        JobAuthorizer, JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
-        SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
+        self, AllocJobResult, AssignJobResult, BuilderInfo, BuilderLimits, HeartbeatServerResult,
+        InputsReader, JobAuthorizer, JobId, JobState, RunJobResult, SchedulerStatusResult,
+        ServerId, ServerNonce, SubmitToolchainResult, Toolchain, ToolchainReader,
+        UpdateJobStateResult,
     };
     use crate::errors::*;
 
@@ -700,95 +733,139 @@ mod server {
                 check_client_auth,
                 check_server_auth,
             } = self;
-            let requester = SchedulerRequester {
-                client: Mutex::new(
-                    new_reqwest_blocking_client()
-                        .context("failed to build scheduler HTTP client")?,
-                ),
+            let router = SchedulerRouter {
+                handler,
+                requester: SchedulerRequester {
+                    client: Mutex::new(
+                        new_reqwest_blocking_client()
+                            .context("failed to build scheduler HTTP client")?,
+                    ),
+                },
+                check_client_auth,
+                check_server_auth,
+                server_certificates: Default::default(),
             };
-
-            macro_rules! check_server_auth_or_err {
-                ($request:ident) => {{
-                    match bearer_http_auth($request).and_then(&*check_server_auth) {
-                        Some(server_id) => {
-                            let origin_ip = if let Some(header_val) = $request.header("X-Real-IP") {
-                                trace!("X-Real-IP: {:?}", header_val);
-                                match header_val.parse() {
-                                    Ok(ip) => ip,
-                                    Err(err) => {
-                                        warn!(
-                                            "X-Real-IP value {:?} could not be parsed: {:?}",
-                                            header_val, err
-                                        );
-                                        return rouille::Response::empty_400();
-                                    }
-                                }
-                            } else {
-                                $request.remote_addr().ip()
-                            };
-                            if server_id.addr().ip() != origin_ip {
-                                trace!("server ip: {:?}", server_id.addr().ip());
-                                trace!("request ip: {:?}", $request.remote_addr().ip());
-                                return make_401("invalid_bearer_token_mismatched_address");
-                            } else {
-                                server_id
-                            }
-                        }
-                        None => return make_401("invalid_bearer_token"),
-                    }
-                }};
-            }
-
-            fn maybe_update_certs(
-                client: &mut reqwest::blocking::Client,
-                certs: &mut HashMap<ServerId, (Vec<u8>, Vec<u8>)>,
-                server_id: ServerId,
-                cert_digest: Vec<u8>,
-                cert_pem: Vec<u8>,
-            ) -> Result<()> {
-                if let Some((saved_cert_digest, _)) = certs.get(&server_id) {
-                    if saved_cert_digest == &cert_digest {
-                        return Ok(());
-                    }
-                }
-                info!(
-                    "Adding new certificate for {} to scheduler",
-                    server_id.addr()
-                );
-                let mut client_builder = new_reqwest_blocking_builder()?;
-                // Add all the certificates we know about
-                client_builder = client_builder.add_root_certificate(
-                    reqwest::Certificate::from_pem(&cert_pem)
-                        .context("failed to interpret pem as certificate")?,
-                );
-                for (_, cert_pem) in certs.values() {
-                    client_builder = client_builder.add_root_certificate(
-                        reqwest::Certificate::from_pem(cert_pem).expect("previously valid cert"),
-                    );
-                }
-                // Finish the client
-                let new_client = client_builder
-                    // Disable connection pool to avoid broken connection
-                    // between runtime
-                    .pool_max_idle_per_host(0)
-                    .build()
-                    .context("failed to create a HTTP client")?;
-                // Use the updated certificates
-                *client = new_client;
-                certs.insert(server_id, (cert_digest, cert_pem));
-                Ok(())
-            }
 
             info!("Scheduler listening for clients on {}", public_addr);
             let request_count = atomic::AtomicUsize::new(0);
-            // From server_id -> cert_digest, cert_pem
-            let server_certificates: Mutex<HashMap<ServerId, (Vec<u8>, Vec<u8>)>> =
-                Default::default();
 
             let server = rouille::Server::new(public_addr, move |request| {
                 let req_id = request_count.fetch_add(1, atomic::Ordering::SeqCst);
-                trace!(target: "sccache_http", "Req {} ({}): {:?}", req_id, request.remote_addr(), request);
-                let response = (|| router!(request,
+                router.respond(req_id, request)
+            })
+            .map_err(|e| {
+                anyhow!(format!(
+                    "Failed to start http server for sccache scheduler: {}",
+                    e
+                ))
+            })?;
+
+            // This limit is rouille's default for `start_server_with_pool`, which
+            // we would use, except that interface doesn't permit any sort of
+            // error handling to be done.
+            let server = server.pool_size(num_cpus() * 8);
+            server.run();
+
+            panic!("Rouille server terminated")
+        }
+    }
+
+    macro_rules! check_server_auth_or_err {
+        ($request:ident, $check_server_auth:expr) => {{
+            match bearer_http_auth($request).and_then($check_server_auth) {
+                Some(server_id) => {
+                    let origin_ip = if let Some(header_val) = $request.header("X-Real-IP") {
+                        trace!("X-Real-IP: {:?}", header_val);
+                        match header_val.parse() {
+                            Ok(ip) => ip,
+                            Err(err) => {
+                                warn!(
+                                    "X-Real-IP value {:?} could not be parsed: {:?}",
+                                    header_val, err
+                                );
+                                return rouille::Response::empty_400();
+                            }
+                        }
+                    } else {
+                        $request.remote_addr().ip()
+                    };
+                    if server_id.addr().ip() != origin_ip {
+                        trace!("server ip: {:?}", server_id.addr().ip());
+                        trace!("request ip: {:?}", $request.remote_addr().ip());
+                        return make_401("invalid_bearer_token_mismatched_address");
+                    } else {
+                        server_id
+                    }
+                }
+                None => return make_401("invalid_bearer_token"),
+            }
+        }};
+    }
+
+    fn maybe_update_certs(
+        client: &mut reqwest::blocking::Client,
+        certs: &mut HashMap<ServerId, (Vec<u8>, Vec<u8>)>,
+        server_id: ServerId,
+        cert_digest: Vec<u8>,
+        cert_pem: Vec<u8>,
+    ) -> Result<()> {
+        if let Some((saved_cert_digest, _)) = certs.get(&server_id) {
+            if saved_cert_digest == &cert_digest {
+                return Ok(());
+            }
+        }
+        info!(
+            "Adding new certificate for {} to scheduler",
+            server_id.addr()
+        );
+        let mut client_builder = new_reqwest_blocking_builder()?;
+        // Add all the certificates we know about
+        client_builder = client_builder.add_root_certificate(
+            reqwest::Certificate::from_pem(&cert_pem)
+                .context("failed to interpret pem as certificate")?,
+        );
+        for (_, cert_pem) in certs.values() {
+            client_builder = client_builder.add_root_certificate(
+                reqwest::Certificate::from_pem(cert_pem).expect("previously valid cert"),
+            );
+        }
+        // Finish the client
+        let new_client = client_builder
+            // Disable connection pool to avoid broken connection
+            // between runtime
+            .pool_max_idle_per_host(0)
+            .build()
+            .context("failed to create a HTTP client")?;
+        // Use the updated certificates
+        *client = new_client;
+        certs.insert(server_id, (cert_digest, cert_pem));
+        Ok(())
+    }
+
+    // separating stuff out of the regular requester for testability reasons
+    struct SchedulerRouter<S> {
+        handler: S,
+        requester: SchedulerRequester,
+        // Is this client permitted to use the scheduler?
+        check_client_auth: Box<dyn ClientAuthCheck>,
+        // Do we believe the server is who they appear to be?
+        check_server_auth: ServerAuthCheck,
+        // From server_id -> cert_digest, cert_pem
+        server_certificates: Mutex<HashMap<ServerId, (Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl<S: dist::SchedulerIncoming> SchedulerRouter<S> {
+        fn respond(&self, req_id: usize, request: &rouille::Request) -> rouille::Response {
+            let Self {
+                handler,
+                requester,
+                check_client_auth,
+                check_server_auth,
+                server_certificates,
+            } = self;
+            trace!(target: "sccache_http", "Req {} ({}): {:?}", req_id, request.remote_addr(), request);
+            let response = (|| {
+                router!(request,
                     (POST) (/api/v1/scheduler/alloc_job) => {
                         let bearer_auth = match bearer_http_auth(request) {
                             Some(s) => s,
@@ -801,10 +878,10 @@ mod server {
                                 return make_401_with_body("bearer_auth_failed", client_msg)
                             },
                         }
-                        let toolchain = try_or_400_log!(req_id, bincode_input(request));
-                        trace!("Req {}: alloc_job: {:?}", req_id, toolchain);
+                        let AllocJobHttpRequest { toolchain, command_hash, client_name } = try_or_400_log!(req_id, bincode_input(request));
+                        trace!("Req {}: alloc_job: {:?} {:?} from {:?}", req_id, toolchain, command_hash, client_name);
 
-                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&requester, toolchain));
+                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester, toolchain, command_hash, client_name));
                         let certs = server_certificates.lock().unwrap();
                         let res = AllocJobHttpResponse::from_alloc_job_result(alloc_job_res, &certs);
                         prepare_response(request, &res)
@@ -824,7 +901,7 @@ mod server {
                         prepare_response(request, &res)
                     },
                     (POST) (/api/v1/scheduler/heartbeat_server) => {
-                        let server_id = check_server_auth_or_err!(request);
+                        let server_id = check_server_auth_or_err!(request, &**check_server_auth);
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
@@ -843,12 +920,22 @@ mod server {
                         prepare_response(request, &res)
                     },
                     (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
-                        let server_id = check_server_auth_or_err!(request);
+                        let server_id = check_server_auth_or_err!(request, &**check_server_auth);
                         let job_state = try_or_400_log!(req_id, bincode_input(request));
                         trace!("Req {}: job state: {:?}", req_id, job_state);
 
                         let res: UpdateJobStateResult = try_or_500_log!(req_id, handler.handle_update_job_state(
                             job_id, server_id, job_state
+                        ));
+                        prepare_response(request, &res)
+                    },
+                    (POST) (/api/v1/scheduler/job_complete/{job_id: JobId}) => {
+                        let server_id = check_server_auth_or_err!(request, &**check_server_auth);
+                        let CompleteJobHttpRequest { peak_memory } = try_or_400_log!(req_id, bincode_input(request));
+                        trace!("Req {}: job complete, peak memory: {:?}", req_id, peak_memory);
+
+                        let res: UpdateJobStateResult = try_or_500_log!(req_id, handler.handle_complete_job(
+                            job_id, server_id, peak_memory
                         ));
                         prepare_response(request, &res)
                     },
@@ -860,18 +947,10 @@ mod server {
                         warn!("Unknown request {:?}", request);
                         rouille::Response::empty_404()
                     },
-                ))();
-                 trace!(target: "sccache_http", "Res {}: {:?}", req_id, response);
-                response
-            }).map_err(|e| anyhow!(format!("Failed to start http server for sccache scheduler: {}", e)))?;
-
-            // This limit is rouille's default for `start_server_with_pool`, which
-            // we would use, except that interface doesn't permit any sort of
-            // error handling to be done.
-            let server = server.pool_size(num_cpus() * 8);
-            server.run();
-
-            panic!("Rouille server terminated")
+                )
+            })();
+            trace!(target: "sccache_http", "Res {}: {:?}", req_id, response);
+            response
         }
     }
 
@@ -907,7 +986,7 @@ mod server {
         // Randomly generated nonce to allow the scheduler to detect server restarts
         server_nonce: ServerNonce,
         name: String,
-        max_jobs: Arc<MaxJobs>,
+        limits: Arc<LiveLimits>,
         dist_control_address: SocketAddr,
         handler: S,
     }
@@ -921,6 +1000,7 @@ mod server {
             scheduler_auth: String,
             name: String,
             max_jobs: usize,
+            max_memory: Option<u64>,
             dist_control_address: SocketAddr,
             handler: S,
         ) -> Result<Self> {
@@ -948,7 +1028,10 @@ mod server {
                 jwt_key,
                 server_nonce,
                 name,
-                max_jobs: Arc::new(MaxJobs::new(max_jobs)),
+                limits: Arc::new(LiveLimits::new(BuilderLimits {
+                    max_jobs,
+                    max_memory,
+                })),
                 dist_control_address,
                 handler,
             })
@@ -965,13 +1048,13 @@ mod server {
                 jwt_key,
                 server_nonce,
                 name,
-                max_jobs,
+                limits,
                 dist_control_address,
                 handler,
             } = self;
 
             let dist_control_address =
-                start_dist_control_listener(dist_control_address, name.clone(), max_jobs.clone())?;
+                start_dist_control_listener(dist_control_address, name.clone(), limits.clone())?;
             info!(
                 "Server listening for control requests on {}",
                 dist_control_address
@@ -979,7 +1062,7 @@ mod server {
 
             let mut heartbeat_request = HeartbeatServerHttpRequest {
                 jwt_key: jwt_key.clone(),
-                info: builder_info(&name, max_jobs.get()),
+                info: builder_info(&name, limits.get()),
                 server_nonce,
                 cert_digest,
                 cert_pem: cert_pem.clone(),
@@ -998,7 +1081,7 @@ mod server {
             // TODO: detect if this panics
             thread::spawn(move || {
                 loop {
-                    heartbeat_request.info.num_cpus = num_cpus();
+                    heartbeat_request.info = builder_info(&name, limits.get());
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
                     let wait = match bincode_req(
                         heartbeat_client
@@ -1020,8 +1103,7 @@ mod server {
                             HEARTBEAT_ERROR_INTERVAL
                         }
                     };
-                    heartbeat_request.info.max_jobs =
-                        max_jobs.wait_for_change(heartbeat_request.info.max_jobs, wait);
+                    limits.wait_for_change(heartbeat_request.info.limits, wait);
                 }
             });
 
@@ -1088,49 +1170,52 @@ mod server {
     }
 
     // mechanism to sleep the heartbeat-sending thread for brief periods but also allow waking it up
-    // whenever the user requests a change to the max jobs via the local dist_control endpoint
-    struct MaxJobs {
-        value: Mutex<usize>,
+    // whenever the user requests a change to the limits via the local dist_control endpoint
+    struct LiveLimits {
+        current: Mutex<BuilderLimits>,
         changed: Condvar,
     }
 
-    impl MaxJobs {
-        fn new(value: usize) -> Self {
+    impl LiveLimits {
+        fn new(current: BuilderLimits) -> Self {
             Self {
-                value: Mutex::new(value),
+                current: Mutex::new(current),
                 changed: Condvar::new(),
             }
         }
-        fn get(&self) -> usize {
-            *self.value.lock().unwrap()
+        fn get(&self) -> BuilderLimits {
+            *self.current.lock().unwrap()
         }
-        fn set(&self, value: usize) {
-            *self.value.lock().unwrap() = value;
+        fn update(&self, change: impl FnOnce(&mut BuilderLimits)) -> BuilderLimits {
+            let mut current = self.current.lock().unwrap();
+            change(&mut current);
             self.changed.notify_all();
+            *current
         }
 
-        // also wakes up if the user requested a change to the max jobs
-        fn wait_for_change(&self, sent: usize, timeout: Duration) -> usize {
-            let (value, _) = self
+        // also wakes up if the user requested a change to the limits
+        fn wait_for_change(&self, sent: BuilderLimits, timeout: Duration) {
+            let _ = self
                 .changed
-                .wait_timeout_while(self.value.lock().unwrap(), timeout, |value| *value == sent)
+                .wait_timeout_while(self.current.lock().unwrap(), timeout, |current| {
+                    *current == sent
+                })
                 .unwrap();
-            *value
         }
     }
 
-    fn builder_info(name: &str, max_jobs: usize) -> BuilderInfo {
+    fn builder_info(name: &str, limits: BuilderLimits) -> BuilderInfo {
         BuilderInfo {
             name: name.to_owned(),
             num_cpus: num_cpus(),
-            max_jobs,
+            limits,
         }
     }
 
     fn start_dist_control_listener(
         dist_control_address: SocketAddr,
         name: String,
-        max_jobs: Arc<MaxJobs>,
+        limits: Arc<LiveLimits>,
     ) -> Result<SocketAddr> {
         let request_count = atomic::AtomicUsize::new(0);
         let server = rouille::Server::new(dist_control_address, move |request| {
@@ -1138,7 +1223,7 @@ mod server {
                 "control-{}",
                 request_count.fetch_add(1, atomic::Ordering::SeqCst)
             );
-            control_response(&request_id, request, &name, &max_jobs)
+            control_response(&request_id, request, &name, &limits)
         })
         .map_err(|error| {
             anyhow!(
@@ -1157,19 +1242,29 @@ mod server {
         request_id: &str,
         request: &rouille::Request,
         name: &str,
-        max_jobs: &MaxJobs,
+        limits: &LiveLimits,
     ) -> rouille::Response {
         trace!("Request {}: {:?}", request_id, request);
         router!(request,
             (GET) (/api/v1/control/builder_info) => {
-                rouille::Response::json(&builder_info(name, max_jobs.get()))
+                rouille::Response::json(&builder_info(name, limits.get()))
             },
             (PUT) (/api/v1/control/max_jobs) => {
-                let SetMaxJobsLocalHttpRequest { max_jobs: value } =
+                let SetMaxJobsLocalHttpRequest { max_jobs } =
                     try_or_400_log!(request_id, rouille::input::json_input(request));
-                max_jobs.set(value);
-                info!("max_jobs set to {} through the dist control listener", value);
-                rouille::Response::json(&builder_info(name, value))
+                let new_limits = limits.update(|limits| limits.max_jobs = max_jobs);
+                info!("max_jobs set to {} through the dist control listener", max_jobs);
+                rouille::Response::json(&builder_info(name, new_limits))
+            },
+            (PUT) (/api/v1/control/max_memory) => {
+                let SetMaxMemoryLocalHttpRequest { max_memory } =
+                    try_or_400_log!(request_id, rouille::input::json_input(request));
+                let new_limits = limits.update(|limits| limits.max_memory = max_memory);
+                match max_memory {
+                    Some(max_memory) => info!("max_memory set to {} bytes through the dist control listener", max_memory),
+                    None => info!("max_memory turned off through the dist control listener"),
+                }
+                rouille::Response::json(&builder_info(name, new_limits))
             },
             _ => {
                 warn!("Unknown dist control request {:?}", request);
@@ -1178,64 +1273,110 @@ mod server {
         )
     }
 
+    #[cfg(test)]
+    fn limits(max_jobs: usize, max_memory: Option<u64>) -> BuilderLimits {
+        BuilderLimits {
+            max_jobs,
+            max_memory,
+        }
+    }
+
+    #[cfg(test)]
+    fn put_json(path: &str, body: &str) -> rouille::Request {
+        rouille::Request::fake_http(
+            "PUT",
+            path,
+            vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body.as_bytes().to_vec(),
+        )
+    }
+
+    #[cfg(test)]
+    fn response_builder_info(response: rouille::Response) -> BuilderInfo {
+        assert_eq!(response.status_code, 200);
+        let (mut body, _) = response.data.into_reader_and_size();
+        serde_json::from_reader(&mut body).unwrap()
+    }
+
     #[test]
     fn set_and_get_max_jobs() {
-        let max_jobs = MaxJobs::new(4);
+        let live_limits = LiveLimits::new(limits(4, None));
         let get = || {
             let request =
                 rouille::Request::fake_http("GET", "/api/v1/control/builder_info", vec![], vec![]);
-            control_response("test", &request, "builder", &max_jobs)
-        };
-        let response_builder_info = |response: rouille::Response| -> BuilderInfo {
-            assert_eq!(response.status_code, 200);
-            let (mut body, _) = response.data.into_reader_and_size();
-            serde_json::from_reader(&mut body).unwrap()
+            control_response("test", &request, "builder", &live_limits)
         };
 
-        assert_eq!(response_builder_info(get()), builder_info("builder", 4));
-
-        let request = rouille::Request::fake_http(
-            "PUT",
-            "/api/v1/control/max_jobs",
-            vec![("Content-Type".to_owned(), "application/json".to_owned())],
-            br#"{"max_jobs": 0}"#.to_vec(),
+        assert_eq!(
+            response_builder_info(get()),
+            builder_info("builder", limits(4, None))
         );
-        let response = control_response("test", &request, "builder", &max_jobs);
-        assert_eq!(response_builder_info(response), builder_info("builder", 0));
-        assert_eq!(max_jobs.get(), 0);
-        assert_eq!(response_builder_info(get()), builder_info("builder", 0));
 
-        let request = rouille::Request::fake_http(
-            "PUT",
-            "/api/v1/control/max_jobs",
-            vec![("Content-Type".to_owned(), "application/json".to_owned())],
-            br#"{"max_jobs": -1}"#.to_vec(),
+        let request = put_json("/api/v1/control/max_jobs", r#"{"max_jobs": 0}"#);
+        let response = control_response("test", &request, "builder", &live_limits);
+        assert_eq!(
+            response_builder_info(response),
+            builder_info("builder", limits(0, None))
         );
-        let response = control_response("test", &request, "builder", &max_jobs);
+        assert_eq!(live_limits.get(), limits(0, None));
+        assert_eq!(
+            response_builder_info(get()),
+            builder_info("builder", limits(0, None))
+        );
+
+        let request = put_json("/api/v1/control/max_jobs", r#"{"max_jobs": -1}"#);
+        let response = control_response("test", &request, "builder", &live_limits);
         assert_eq!(response.status_code, 400);
-        assert_eq!(max_jobs.get(), 0);
+        assert_eq!(live_limits.get(), limits(0, None));
+    }
+
+    #[test]
+    fn set_and_clear_max_memory() {
+        let live_limits = LiveLimits::new(limits(4, None));
+
+        let request = put_json(
+            "/api/v1/control/max_memory",
+            r#"{"max_memory": 1073741824}"#,
+        );
+        let response = control_response("test", &request, "builder", &live_limits);
+        assert_eq!(
+            response_builder_info(response),
+            builder_info("builder", limits(4, Some(1 << 30)))
+        );
+        assert_eq!(live_limits.get(), limits(4, Some(1 << 30)));
+
+        for body in [r#"{"max_memory": -1}"#, r#"{"max_memory": "1G"}"#, r#"{}"#] {
+            let request = put_json("/api/v1/control/max_memory", body);
+            let response = control_response("test", &request, "builder", &live_limits);
+            assert_eq!(response.status_code, 400, "{body}");
+        }
+        assert_eq!(live_limits.get(), limits(4, Some(1 << 30)));
+
+        let request = put_json("/api/v1/control/max_memory", r#"{"max_memory": null}"#);
+        let response = control_response("test", &request, "builder", &live_limits);
+        assert_eq!(
+            response_builder_info(response),
+            builder_info("builder", limits(4, None))
+        );
+        assert_eq!(live_limits.get(), limits(4, None));
     }
 
     #[test]
     fn changing_config_waking_up_heartbeat_thread() {
-        let max_jobs = Arc::new(MaxJobs::new(4));
+        let live_limits = Arc::new(LiveLimits::new(limits(4, None)));
         let setter = {
-            let max_jobs = max_jobs.clone();
+            let live_limits = live_limits.clone();
             thread::spawn(move || {
-                thread::sleep(Duration::from_millis(50));
-                max_jobs.set(7);
+                live_limits.update(|limits| limits.max_jobs = 7);
             })
         };
-        let start = std::time::Instant::now();
-
-        // I guess in theory this could be a race if our thread gets unscheduled for an entire minute
-        assert_eq!(max_jobs.wait_for_change(4, Duration::from_secs(60)), 7);
-        assert!(start.elapsed() < Duration::from_secs(30));
+        live_limits.wait_for_change(limits(4, None), Duration::MAX);
+        assert_eq!(live_limits.get(), limits(7, None));
         setter.join().unwrap();
 
-        max_jobs.set(2);
-        assert_eq!(max_jobs.wait_for_change(7, Duration::from_secs(60)), 2);
-        assert_eq!(max_jobs.wait_for_change(2, Duration::from_millis(10)), 2);
+        live_limits.update(|limits| limits.max_memory = Some(1 << 30));
+        live_limits.wait_for_change(limits(7, None), Duration::MAX);
+        assert_eq!(live_limits.get(), limits(7, Some(1 << 30)));
     }
 
     #[cfg(test)]
@@ -1279,6 +1420,7 @@ mod server {
             String::new(),
             "builder".to_owned(),
             1,
+            None,
             "0.0.0.0:10502".parse().unwrap(),
             // no incoming messages given to server
             UnusedServerIncoming,
@@ -1290,33 +1432,323 @@ mod server {
     #[cfg(feature = "dist-client")]
     #[test]
     fn make_dist_controls_api_request() {
-        let max_jobs = Arc::new(MaxJobs::new(4));
+        let live_limits = Arc::new(LiveLimits::new(limits(4, None)));
         let address = start_dist_control_listener(
             "127.0.0.1:0".parse().unwrap(),
             "builder".to_owned(),
-            max_jobs.clone(),
+            live_limits.clone(),
         )
         .unwrap();
         assert_ne!(address.port(), 0);
 
         assert_eq!(
-            super::client::request_dist_control(address, None).unwrap(),
-            builder_info("builder", 4)
+            super::client::request_dist_control(address, None, None).unwrap(),
+            builder_info("builder", limits(4, None))
         );
         assert_eq!(
-            super::client::request_dist_control(address, Some(0)).unwrap(),
-            builder_info("builder", 0)
+            super::client::request_dist_control(address, Some(0), None).unwrap(),
+            builder_info("builder", limits(0, None))
         );
-        assert_eq!(max_jobs.get(), 0);
+        assert_eq!(
+            super::client::request_dist_control(address, None, Some(Some(1 << 30))).unwrap(),
+            builder_info("builder", limits(0, Some(1 << 30)))
+        );
+        assert_eq!(
+            super::client::request_dist_control(address, Some(2), Some(Some(1 << 20))).unwrap(),
+            builder_info("builder", limits(2, Some(1 << 20)))
+        );
+        assert_eq!(live_limits.get(), limits(2, Some(1 << 20)));
+        assert_eq!(
+            super::client::request_dist_control(address, None, Some(None)).unwrap(),
+            builder_info("builder", limits(2, None))
+        );
+        assert_eq!(live_limits.get(), limits(2, None));
 
         let response = new_reqwest_blocking_client()
+            .unwrap()
             .put(urls::dist_control_max_jobs(address))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(r#"{"max_jobs": "many"}"#)
             .send()
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-        assert_eq!(max_jobs.get(), 0);
+        assert_eq!(live_limits.get(), limits(2, None));
+    }
+
+    #[cfg(test)]
+    #[derive(Default)]
+    struct RecordingScheduler {
+        allocations: Mutex<Vec<(dist::CommandHash, String)>>,
+        state_updates: Mutex<Vec<(JobId, ServerId, JobState)>>,
+        completions: Mutex<Vec<(JobId, ServerId, Option<u64>)>>,
+    }
+
+    #[cfg(test)]
+    impl dist::SchedulerIncoming for RecordingScheduler {
+        fn handle_alloc_job(
+            &self,
+            _requester: &dyn dist::SchedulerOutgoing,
+            _toolchain: Toolchain,
+            command_hash: dist::CommandHash,
+            client_name: String,
+        ) -> Result<AllocJobResult> {
+            self.allocations
+                .lock()
+                .unwrap()
+                .push((command_hash, client_name));
+            Ok(AllocJobResult::Fail {
+                msg: "recorded".to_owned(),
+            })
+        }
+        fn handle_heartbeat_server(
+            &self,
+            _server_id: ServerId,
+            _server_nonce: ServerNonce,
+            _info: BuilderInfo,
+            _job_authorizer: Box<dyn JobAuthorizer>,
+        ) -> Result<HeartbeatServerResult> {
+            unreachable!()
+        }
+        fn handle_update_job_state(
+            &self,
+            job_id: JobId,
+            server_id: ServerId,
+            job_state: JobState,
+        ) -> Result<UpdateJobStateResult> {
+            self.state_updates
+                .lock()
+                .unwrap()
+                .push((job_id, server_id, job_state));
+            Ok(UpdateJobStateResult::Success)
+        }
+        fn handle_complete_job(
+            &self,
+            job_id: JobId,
+            server_id: ServerId,
+            peak_memory: Option<u64>,
+        ) -> Result<UpdateJobStateResult> {
+            self.completions
+                .lock()
+                .unwrap()
+                .push((job_id, server_id, peak_memory));
+            Ok(UpdateJobStateResult::Success)
+        }
+        fn handle_status(&self) -> Result<SchedulerStatusResult> {
+            unreachable!()
+        }
+    }
+
+    #[cfg(test)]
+    struct AcceptAnyClient;
+
+    #[cfg(test)]
+    impl ClientAuthCheck for AcceptAnyClient {
+        fn check(&self, _token: &str) -> StdResult<(), ClientVisibleMsg> {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    const TEST_SERVER_TOKEN: &str = "server token";
+
+    #[cfg(test)]
+    fn test_server_id() -> ServerId {
+        "127.0.0.1:10501".parse().unwrap()
+    }
+
+    #[cfg(test)]
+    fn recording_router() -> SchedulerRouter<RecordingScheduler> {
+        SchedulerRouter {
+            handler: RecordingScheduler::default(),
+            requester: SchedulerRequester {
+                client: Mutex::new(new_reqwest_blocking_client().unwrap()),
+            },
+            check_client_auth: Box::new(AcceptAnyClient),
+            check_server_auth: Box::new(|token| (token == TEST_SERVER_TOKEN).then(test_server_id)),
+            server_certificates: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn bincode_post(from: SocketAddr, path: &str, token: &str, body: Vec<u8>) -> rouille::Request {
+        rouille::Request::fake_http_from(
+            from,
+            "POST",
+            path,
+            vec![
+                ("Authorization".to_owned(), format!("Bearer {token}")),
+                (
+                    "Content-Type".to_owned(),
+                    "application/octet-stream".to_owned(),
+                ),
+            ],
+            body,
+        )
+    }
+
+    #[cfg(test)]
+    fn test_command_hash() -> dist::CommandHash {
+        serde_json::from_value(serde_json::Value::String(format!("{:064x}", 7))).unwrap()
+    }
+
+    #[cfg(test)]
+    fn test_toolchain() -> Toolchain {
+        Toolchain {
+            archive_id: format!("{:064x}", 1),
+        }
+    }
+
+    #[test]
+    fn scheduler_allocation_with_command_hash_and_client_name() {
+        let router = recording_router();
+        let client: SocketAddr = "192.0.2.7:40000".parse().unwrap();
+        let body = bincode::serialize(&AllocJobHttpRequest {
+            toolchain: test_toolchain(),
+            command_hash: test_command_hash(),
+            client_name: "workstation-1".to_owned(),
+        })
+        .unwrap();
+        let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
+        let response = router.respond(0, &request);
+        assert_eq!(response.status_code, 200);
+        let (mut body, _) = response.data.into_reader_and_size();
+        let response: AllocJobHttpResponse = bincode::deserialize_from(&mut body).unwrap();
+        assert!(matches!(response, AllocJobHttpResponse::Fail { .. }));
+        assert_eq!(
+            *router.handler.allocations.lock().unwrap(),
+            vec![(test_command_hash(), "workstation-1".to_owned())]
+        );
+
+        // The request body before the command hash and client name were added
+        let body = bincode::serialize(&test_toolchain()).unwrap();
+        let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
+        assert_eq!(router.respond(1, &request).status_code, 400);
+        assert_eq!(router.handler.allocations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scheduler_getting_updates_about_completed_jobs() {
+        let router = recording_router();
+        let from = SocketAddr::new(test_server_id().addr().ip(), 50000);
+
+        let body = bincode::serialize(&JobState::Ready).unwrap();
+        let request = bincode_post(
+            from,
+            "/api/v1/scheduler/job_state/5",
+            TEST_SERVER_TOKEN,
+            body,
+        );
+        assert_eq!(router.respond(0, &request).status_code, 200);
+        assert_eq!(
+            *router.handler.state_updates.lock().unwrap(),
+            vec![(JobId(5), test_server_id(), JobState::Ready)]
+        );
+
+        let body = bincode::serialize(&CompleteJobHttpRequest {
+            peak_memory: Some(123),
+        })
+        .unwrap();
+        let request = bincode_post(
+            from,
+            "/api/v1/scheduler/job_complete/5",
+            TEST_SERVER_TOKEN,
+            body,
+        );
+        assert_eq!(router.respond(1, &request).status_code, 200);
+        assert_eq!(
+            *router.handler.completions.lock().unwrap(),
+            vec![(JobId(5), test_server_id(), Some(123))]
+        );
+
+        // send job complete notification
+        let body = bincode::serialize(&JobState::Started).unwrap();
+        let request = bincode_post(
+            from,
+            "/api/v1/scheduler/job_complete/6",
+            TEST_SERVER_TOKEN,
+            body,
+        );
+        assert_eq!(router.respond(2, &request).status_code, 400);
+
+        // same token used from a different IP address is unauthorized (static IP is required
+        // anyways)
+        let body = bincode::serialize(&CompleteJobHttpRequest { peak_memory: None }).unwrap();
+        let other: SocketAddr = "192.0.2.8:50000".parse().unwrap();
+        let request = bincode_post(
+            other,
+            "/api/v1/scheduler/job_complete/6",
+            TEST_SERVER_TOKEN,
+            body,
+        );
+        assert_eq!(router.respond(3, &request).status_code, 401);
+        assert_eq!(router.handler.completions.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(test)]
+    fn start_recording_scheduler() -> (Arc<SchedulerRouter<RecordingScheduler>>, reqwest::Url) {
+        let router = Arc::new(recording_router());
+        let server = {
+            let router = router.clone();
+            rouille::Server::new("127.0.0.1:0", move |request| router.respond(0, request)).unwrap()
+        };
+        let url = reqwest::Url::parse(&format!("http://{}", server.server_addr())).unwrap();
+        thread::spawn(move || server.run());
+        (router, url)
+    }
+
+    #[test]
+    fn test_server_requester_reaches_scheduler_routes() {
+        let (router, scheduler_url) = start_recording_scheduler();
+        let requester = ServerRequester {
+            client: new_reqwest_blocking_client().unwrap(),
+            scheduler_url,
+            scheduler_auth: TEST_SERVER_TOKEN.to_owned(),
+        };
+        use dist::ServerOutgoing;
+        requester
+            .do_update_job_state(JobId(3), JobState::Started)
+            .unwrap();
+        requester.do_complete_job(JobId(3), Some(4096)).unwrap();
+        requester.do_complete_job(JobId(4), None).unwrap();
+        assert_eq!(
+            *router.handler.state_updates.lock().unwrap(),
+            vec![(JobId(3), test_server_id(), JobState::Started)]
+        );
+        assert_eq!(
+            *router.handler.completions.lock().unwrap(),
+            vec![
+                (JobId(3), test_server_id(), Some(4096)),
+                (JobId(4), test_server_id(), None)
+            ]
+        );
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_client_alloc_job_reaches_scheduler_route() {
+        use dist::Client as _;
+        let (router, scheduler_url) = start_recording_scheduler();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = super::client::Client::new(
+            runtime.handle(),
+            scheduler_url,
+            cache_directory.path(),
+            1024 * 1024,
+            &[],
+            "client token".to_owned(),
+            false,
+            "workstation-1".to_owned(),
+        )
+        .unwrap();
+        let result = runtime
+            .block_on(client.do_alloc_job(test_toolchain(), test_command_hash()))
+            .unwrap();
+        assert!(matches!(result, AllocJobResult::Fail { .. }));
+        assert_eq!(
+            *router.handler.allocations.lock().unwrap(),
+            vec![(test_command_hash(), "workstation-1".to_owned())]
+        );
     }
 
     struct ServerRequester {
@@ -1340,6 +1772,20 @@ mod server {
             )
             .context("POST to scheduler job_state failed")
         }
+        fn do_complete_job(
+            &self,
+            job_id: JobId,
+            peak_memory: Option<u64>,
+        ) -> Result<UpdateJobStateResult> {
+            let url = urls::scheduler_complete_job(&self.scheduler_url, job_id);
+            bincode_req(
+                self.client
+                    .post(url)
+                    .bearer_auth(self.scheduler_auth.clone())
+                    .bincode(&CompleteJobHttpRequest { peak_memory })?,
+            )
+            .context("POST to scheduler job_complete failed")
+        }
     }
 }
 
@@ -1349,7 +1795,7 @@ mod client {
     use crate::config;
     use crate::dist::pkg::{InputsPackager, ToolchainPackager};
     use crate::dist::{
-        self, AllocJobResult, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
+        self, AllocJobResult, CommandHash, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
         SchedulerStatusResult, SubmitToolchainResult, Toolchain,
     };
 
@@ -1366,7 +1812,7 @@ mod client {
     use std::time::Duration;
 
     use super::common::{
-        AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
+        AllocJobHttpRequest, AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
         ServerCertificateHttpResponse, bincode_req_fut,
     };
     use super::urls;
@@ -1377,26 +1823,45 @@ mod client {
     const CONNECT_TIMEOUT_SECS: u64 = 5;
 
     // get info about the build server via the CLI, such as name, CPU, etc
-    // If set_max_jobs is specified then we set that in addition to getting
-    // the info
+    // If set_max_jobs or set_max_memory is specified then we set those in
+    // addition to getting the info. use Some(None) for set_max_memory to
+    // disable memory limits
     pub fn request_dist_control(
         dist_control_address: std::net::SocketAddr,
         set_max_jobs: Option<usize>,
+        set_max_memory: Option<Option<u64>>,
     ) -> Result<dist::BuilderInfo> {
-        let client = crate::util::new_reqwest_blocking_client();
-        let request = match set_max_jobs {
-            Some(max_jobs) => client
-                .put(urls::dist_control_max_jobs(dist_control_address))
-                .json(&super::common::SetMaxJobsLocalHttpRequest { max_jobs }),
-            None => client.get(urls::dist_control_builder_info(dist_control_address)),
-        };
-        request
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.json())
-            .with_context(|| {
-                format!("failed to reach the dist control listener at {dist_control_address}")
-            })
+        let client = crate::util::new_reqwest_blocking_client()
+            .context("failed to build dist control HTTP client")?;
+        let send_and_parse_builder_info =
+            |request: reqwest::blocking::RequestBuilder| -> Result<dist::BuilderInfo> {
+                request
+                    .send()
+                    .and_then(|response| response.error_for_status())
+                    .and_then(|response| response.json())
+                    .with_context(|| {
+                        format!(
+                            "failed to reach the dist control listener at {dist_control_address}"
+                        )
+                    })
+            };
+        if let Some(max_jobs) = set_max_jobs {
+            send_and_parse_builder_info(
+                client
+                    .put(urls::dist_control_max_jobs(dist_control_address))
+                    .json(&super::common::SetMaxJobsLocalHttpRequest { max_jobs }),
+            )?;
+        }
+        if let Some(max_memory) = set_max_memory {
+            send_and_parse_builder_info(
+                client
+                    .put(urls::dist_control_max_memory(dist_control_address))
+                    .json(&super::common::SetMaxMemoryLocalHttpRequest { max_memory }),
+            )?;
+        }
+        send_and_parse_builder_info(
+            client.get(urls::dist_control_builder_info(dist_control_address)),
+        )
     }
 
     pub struct Client {
@@ -1408,9 +1873,11 @@ mod client {
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
+        name: String,
     }
 
     impl Client {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             pool: &tokio::runtime::Handle,
             scheduler_url: reqwest::Url,
@@ -1419,6 +1886,7 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
+            name: String,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
@@ -1441,6 +1909,7 @@ mod client {
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
+                name,
             })
         }
 
@@ -1478,11 +1947,21 @@ mod client {
 
     #[async_trait]
     impl dist::Client for Client {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+        async fn do_alloc_job(
+            &self,
+            tc: Toolchain,
+            command_hash: CommandHash,
+        ) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_alloc_job(&scheduler_url);
             let mut req = self.client.lock().unwrap().post(url);
-            req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
+            req = req
+                .bearer_auth(self.auth_token.clone())
+                .bincode(&AllocJobHttpRequest {
+                    toolchain: tc,
+                    command_hash,
+                    client_name: self.name.clone(),
+                })?;
 
             let client = self.client.clone();
             let server_certs = self.server_certs.clone();

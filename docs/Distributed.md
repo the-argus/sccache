@@ -296,6 +296,13 @@ Use the `--config` argument to pass the path to its configuration file to `sccac
 # The socket address the scheduler will listen on. It's strongly recommended
 # to listen on localhost and put a HTTPS server in front of it.
 public_addr = "127.0.0.1:10600"
+# where to store history of memory usage of known commands
+# default: memory-history.json in the sccache-dist-scheduler cache directory
+# (for example ~/.cache/sccache-dist-scheduler)
+#memory_history_path = "/var/lib/sccache-dist/memory-history.json"
+# max commands to remember in the memory usage history file. default is 100,000
+# which translates to about a 1MB file
+#memory_history_max_entries = 100000
 
 [client_auth]
 type = "token"
@@ -373,6 +380,10 @@ scheduler_url = "https://192.168.1.1"
 #name = "builder-1"
 # max jobs that can be assigned, default is cores + 1 + cores / 8
 #max_jobs = 17
+# total memory usage that is allowed for all sccache jobs to be using.
+# valid units are K/M/G/T. default value is the memory available (MemAvailable
+# in /proc/meminfo) when the build server starts. Linux only, otherwise unlimited
+#max_memory = "64G"
 # local address that is used for sccache CLI to communicate with a locally
 # running build server
 #dist_control_address = "127.0.0.1:10502"
@@ -437,33 +448,78 @@ type = "DANGEROUSLY_INSECURE"
 ```
 
 
-#### Changing max_jobs at runtime
+#### Changing max_jobs and max_memory at runtime
 
-A builder's `max_jobs` can be changed while it is running. This is an ephemeral
-change, so the builder returns to the value from the config file when it
-restarts. This is useful for developers who are sharing cores of their personal
-machines with each other. When a personal machine is a build server like this,
-it can be useful to limit the compute that sccache will use when doing other
-computationally expensive tasks.
+A builder's `max_jobs` and `max_memory` can be changed while it is running.
+This is an ephemeral change, so the builder returns to the values from the
+config file when it restarts. This is useful for developers who are sharing
+cores of their personal machines with each other. When a personal machine is a
+build server like this, it can be useful to limit the compute and memory that
+sccache will use when doing other computationally expensive tasks.
 
-Note that setting max jobs only affects future scheduling decisions and will
-never cause jobs to be killed.
+Note that setting max jobs or max memory only affects future scheduling
+decisions and will never cause jobs to be killed.
 
-To set max jobs, use the `sccache` CLI (`dist-client` feature must have been
-enabled during build):
+To set max jobs or max memory, use the `sccache` CLI (`dist-client` feature
+must have been enabled during build):
 
 ```
-# print name, number of CPUs, and max jobs according to the local build server
+# print name, number of CPUs, and limits according to the local build server,
+# for example:
+# {"name":"builder-1","num_cpus":16,"limits":{"max_jobs":19,"max_memory":68719476736}}
 sccache --dist-builder-info
 # set the number of max jobs to 4 and then also print stats afterwards like
 # --dist-builder-info does
 sccache --dist-builder-max-jobs 4
+# set max memory (use K, M, G or T suffix, or else bytes are the default unit),
+# then print stats like --dist-builder-info does
+sccache --dist-builder-max-memory 48G
+# turn the memory limit off
+sccache --dist-builder-max-memory none
 # override the dist control address from the one in the client config
 sccache --dist-builder-info --dist-control-address 127.0.0.1:20502
 ```
 
 The dist control is meant to be a replacement for a socket, so it only works
 with a loopback address.
+
+The limits that the scheduler has received from each builder are listed under
+`servers` in the output of `sccache --dist-status`.
+
+
+#### Memory limits
+
+The scheduler estimates the peak memory of every job and only assigns a job to
+a builder if the estimates of the jobs already assigned to it, plus the
+estimate of the new job, are at most the builder's `max_memory`. This is in
+addition to the `max_jobs` limit. The memory values are not enforced, however,
+so if a job uses much more than expected it can still cause OOM and it won't be
+killed. It's advisable to use something like cgroup memory limits or earlyoom
+to get better guarantees.
+
+Memory usage is estimated as follows:
+
+1. the peak memory last measured for the same compile command
+2. otherwise assume it will be the same as the peak memory of the most recently
+   completed job requested by the same client machine (note that this working
+   properly requires clients to have different hostnames or else configure
+   different `name` values in their client config)
+3. else: 1GB
+
+When using sccache dist with Docker or Pot, measuring memory usage is not
+supported, so it is assumed every job takes 1GB, which may still lead to system
+OOM for very memory hungry builds.
+
+The scheduler exposes a config option `memory_history_path` for where to save
+memory usage history, and `memory_history_max_entries` to limit the max size
+of that file.
+
+Note that if it is expected that a job will use more memory than any builder
+has available, it will be considered failed and the requesting client will be
+forced to compile it. In this case there is no mechanism to measure memory
+again, so this job will continue to be compiled locally since any change to the
+expected amount of memory it uses is unknown. Unless the available memory of the
+builders increases.
 
 # Building the Distributed Server Binaries
 

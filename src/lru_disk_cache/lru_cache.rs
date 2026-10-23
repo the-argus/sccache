@@ -342,6 +342,14 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
         self.map.get_refresh(k).map(|v| v as &V)
     }
 
+    /// Get a reference to a value without marking it as most recently used
+    pub fn peek<Q: Hash + Eq + ?Sized>(&self, k: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.map.get(k)
+    }
+
     /// Inserts a key-value pair into the cache. If the key already existed, the old value is
     /// returned.
     ///
@@ -699,6 +707,18 @@ mod tests {
         cache.insert("1", 19);
         assert_eq!(cache.get_mut("1"), Some(&mut 19));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_peek() {
+        let mut cache = LruCache::new(2);
+        cache.insert("1", 10);
+        cache.insert("2", 20);
+        assert_eq!(cache.peek("1"), Some(&10));
+        assert_eq!(cache.peek("3"), None);
+        cache.insert("3", 30);
+        assert_eq!(cache.peek("1"), None);
+        assert_eq!(cache.peek("2"), Some(&20));
     }
 
     #[test]

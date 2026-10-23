@@ -26,17 +26,26 @@ use sccache::errors::*;
 mod harness;
 
 fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path) {
+    compile_c_file(tmpdir, sccache_cfg_path, sccache_cached_cfg_path, "x");
+}
+
+fn compile_c_file(
+    tmpdir: &Path,
+    sccache_cfg_path: &Path,
+    sccache_cached_cfg_path: &Path,
+    name: &str,
+) {
     let envs: Vec<(_, &OsStr)> = vec![
         ("RUST_BACKTRACE", "1".as_ref()),
         ("SCCACHE_LOG", "debug".as_ref()),
         ("SCCACHE_CONF", sccache_cfg_path.as_ref()),
         ("SCCACHE_CACHED_CONF", sccache_cached_cfg_path.as_ref()),
     ];
-    let source_file = "x.c";
-    let obj_file = "x.o";
+    let source_file = format!("{name}.c");
+    let obj_file = format!("{name}.o");
     write_source(
         tmpdir,
-        source_file,
+        &source_file,
         "#if !defined(SCCACHE_TEST_DEFINE)\n#error SCCACHE_TEST_DEFINE is not defined\n#endif\nint x() { return 5; }",
     );
     sccache_command()
@@ -284,6 +293,20 @@ fn compile_until_dist_stats(
     }
 }
 
+fn set_builder_max_memory(
+    system: &harness::DistSystem,
+    sccache_config_path: &Path,
+    max_memory: &str,
+    expected: Option<u64>,
+) {
+    sccache_command()
+        .args(["--dist-builder-max-memory", max_memory])
+        .env("SCCACHE_CONF", sccache_config_path)
+        .assert()
+        .success();
+    system.wait_for_builder_limits(|limits| limits.max_memory == expected);
+}
+
 #[test]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_max_jobs_via_dist_control() {
@@ -334,6 +357,70 @@ fn test_dist_max_jobs_via_dist_control() {
         1,
         0,
     );
+}
+
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_max_memory_via_dist_control() {
+    let temporary_directory = tempfile::Builder::new()
+        .prefix("sccache_dist_test")
+        .tempdir()
+        .unwrap();
+    let temporary_directory = temporary_directory.path();
+    let sccache_dist = harness::sccache_dist_path();
+
+    let mut system = harness::DistSystem::new(&sccache_dist, temporary_directory);
+    system.add_scheduler();
+    let server_handle = system.add_server();
+
+    let mut sccache_config =
+        dist_test_sccache_client_cfg(temporary_directory, system.scheduler_url());
+    sccache_config.dist.dist_control_address = server_handle.dist_control_address();
+    let sccache_config_path = temporary_directory.join("sccache-cfg.json");
+    write_json_cfg(temporary_directory, "sccache-cfg.json", &sccache_config);
+    let sccache_cached_config_path = temporary_directory.join("sccache-cached-cfg");
+
+    stop_local_daemon();
+    start_local_daemon(&sccache_config_path, &sccache_cached_config_path);
+
+    const HALF_GIBIBYTE: u64 = 512 * 1024 * 1024;
+
+    // default guess for memory usage is 1GB which is too much
+    set_builder_max_memory(&system, &sccache_config_path, "512M", Some(HALF_GIBIBYTE));
+    basic_compile(
+        temporary_directory,
+        &sccache_config_path,
+        &sccache_cached_config_path,
+    );
+    get_stats(|info| {
+        assert_eq!(0, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(1, info.stats.dist_errors);
+    });
+
+    set_builder_max_memory(&system, &sccache_config_path, "none", None);
+    basic_compile(
+        temporary_directory,
+        &sccache_config_path,
+        &sccache_cached_config_path,
+    );
+    get_stats(|info| {
+        assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(1, info.stats.dist_errors);
+    });
+
+    // now that the compilation has been registered as requiring very little memory, the next
+    // unknown request from the same client should be assumed to be about the same
+    set_builder_max_memory(&system, &sccache_config_path, "512M", Some(HALF_GIBIBYTE));
+    compile_c_file(
+        temporary_directory,
+        &sccache_config_path,
+        &sccache_cached_config_path,
+        "y",
+    );
+    get_stats(|info| {
+        assert_eq!(2, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(1, info.stats.dist_errors);
+    });
 }
 
 #[test]

@@ -794,6 +794,23 @@ fn empty_server_info(config: &Config) -> Result<ServerInfo> {
 }
 
 /// Run `cmd` and return the process exit status.
+#[cfg(feature = "dist-client")]
+fn write_dist_builder_info(
+    dist_control_address: std::net::SocketAddr,
+    set_max_jobs: Option<usize>,
+    set_max_memory: Option<Option<u64>>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let builder_info = crate::dist::http::request_dist_control(
+        dist_control_address,
+        set_max_jobs,
+        set_max_memory,
+    )?;
+    serde_json::to_writer(&mut *output, &builder_info)?;
+    writeln!(output)?;
+    Ok(())
+}
+
 pub fn run_command(cmd: Command) -> Result<i32> {
     // Config isn't required for all commands, but if it's broken then we should flag
     // it early and loudly.
@@ -954,19 +971,21 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::DistBuilderInfo {
             dist_control_address,
             set_max_jobs,
+            set_max_memory,
         } => {
             trace!("Command::DistBuilderInfo");
-            let dist_control_address =
-                dist_control_address.unwrap_or(config.dist.dist_control_address);
-            let builder_info =
-                crate::dist::http::request_dist_control(dist_control_address, set_max_jobs)?;
-            serde_json::to_writer(&mut io::stdout(), &builder_info)?;
-            println!();
+            write_dist_builder_info(
+                dist_control_address.unwrap_or(config.dist.dist_control_address),
+                set_max_jobs,
+                set_max_memory,
+                &mut io::stdout(),
+            )?;
         }
         #[cfg(not(feature = "dist-client"))]
         Command::DistBuilderInfo {
             dist_control_address: _dist_control_address,
             set_max_jobs: _set_max_jobs,
+            set_max_memory: _set_max_memory,
         } => {
             bail!("Distributed compilation not enabled in this build, requires dist-client feature")
         }
@@ -1070,6 +1089,70 @@ mod test {
     };
     use crate::net::Connection;
     use std::sync::{Arc, Mutex};
+
+    // record requests to the dist server control endpoint
+    #[cfg(all(feature = "dist-client", feature = "dist-server"))]
+    fn start_recording_dist_control_listener() -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+        use std::io::Read;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = {
+            let requests = requests.clone();
+            rouille::Server::new("127.0.0.1:0", move |request| {
+                let mut body = String::new();
+                if let Some(mut data) = request.data() {
+                    data.read_to_string(&mut body).unwrap();
+                }
+                requests.lock().unwrap().push(format!(
+                    "{} {} {}",
+                    request.method(),
+                    request.url(),
+                    body
+                ));
+                rouille::Response::json(&crate::dist::BuilderInfo {
+                    name: "builder".to_owned(),
+                    num_cpus: 4,
+                    limits: crate::dist::BuilderLimits {
+                        max_jobs: 3,
+                        max_memory: None,
+                    },
+                })
+            })
+            .unwrap()
+        };
+        let address = server.server_addr();
+        std::thread::spawn(move || server.run());
+        (address, requests)
+    }
+
+    #[cfg(all(feature = "dist-client", feature = "dist-server"))]
+    #[test]
+    fn build_server_applying_settings_due_to_command() {
+        let (address, requests) = start_recording_dist_control_listener();
+        let mut output = Vec::new();
+        write_dist_builder_info(address, Some(3), Some(None), &mut output).unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                r#"PUT /api/v1/control/max_jobs {"max_jobs":3}"#,
+                r#"PUT /api/v1/control/max_memory {"max_memory":null}"#,
+                "GET /api/v1/control/builder_info ",
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"name\":\"builder\",\"num_cpus\":4,\"limits\":{\"max_jobs\":3,\"max_memory\":null}}\n"
+        );
+
+        requests.lock().unwrap().clear();
+        write_dist_builder_info(address, None, Some(Some(1024)), &mut Vec::new()).unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                r#"PUT /api/v1/control/max_memory {"max_memory":1024}"#,
+                "GET /api/v1/control/builder_info ",
+            ]
+        );
+    }
 
     fn make_runtime() -> Runtime {
         tokio::runtime::Builder::new_current_thread()

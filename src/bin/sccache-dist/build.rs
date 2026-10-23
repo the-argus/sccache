@@ -410,10 +410,11 @@ impl OverlayBuilder {
                     cmd.arg("--");
                     cmd.arg(executable);
                     cmd.args(arguments);
-                    let compile_output = cmd
-                        .output()
-                        .context("Failed to retrieve output from compile")?;
+                    let (compile_output, peak_memory) =
+                        crate::peak_memory::output_with_peak_memory(&mut cmd)
+                            .context("Failed to retrieve output from compile")?;
                     trace!("compile_output: {:?}", compile_output);
+                    trace!("peak_memory: {:?}", peak_memory);
 
                     trace!("retrieving {:?}", output_paths);
                     // The compile may have added symlinks of its own, so read the outputs
@@ -446,6 +447,7 @@ impl OverlayBuilder {
                     Ok(BuildResult {
                         output: compile_output,
                         outputs,
+                        peak_memory,
                     })
                     // Bizarrely there's no way to actually get any information from a thread::Result::Err
                 })
@@ -881,6 +883,9 @@ impl DockerBuilder {
         Ok(BuildResult {
             output: compile_output,
             outputs,
+            // compilations jobs arent child processes so we don't have a way to measure their
+            // memory usage, currently
+            peak_memory: None,
         })
     }
 }
