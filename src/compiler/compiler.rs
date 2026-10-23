@@ -970,8 +970,11 @@ where
             tc_archive = Some(archive_path);
         }
 
+        let command_hash = dist::CommandHash::new(&dist_compile_cmd, &dist_toolchain)?;
         debug!("[{}]: Requesting allocation", out_pretty);
-        let jares = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
+        let jares = dist_client
+            .do_alloc_job(dist_toolchain.clone(), command_hash)
+            .await?;
         let job_alloc = match jares {
             dist::AllocJobResult::Success {
                 job_alloc,
@@ -3876,7 +3879,7 @@ mod test_dist {
     }
     #[async_trait]
     impl dist::Client for ErrorPutToolchainClient {
-        async fn do_alloc_job(&self, _: Toolchain) -> Result<AllocJobResult> {
+        async fn do_alloc_job(&self, _: Toolchain, _: dist::CommandHash) -> Result<AllocJobResult> {
             unreachable!()
         }
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
@@ -3929,7 +3932,11 @@ mod test_dist {
     }
     #[async_trait]
     impl dist::Client for ErrorAllocJobClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+        async fn do_alloc_job(
+            &self,
+            tc: Toolchain,
+            _: dist::CommandHash,
+        ) -> Result<AllocJobResult> {
             assert_eq!(self.tc, tc);
             Err(anyhow!("MOCK: alloc job failure"))
         }
@@ -3986,7 +3993,11 @@ mod test_dist {
 
     #[async_trait]
     impl dist::Client for ErrorSubmitToolchainClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+        async fn do_alloc_job(
+            &self,
+            tc: Toolchain,
+            _: dist::CommandHash,
+        ) -> Result<AllocJobResult> {
             assert!(
                 !self
                     .has_started
@@ -4057,7 +4068,11 @@ mod test_dist {
 
     #[async_trait]
     impl dist::Client for ErrorRunJobClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+        async fn do_alloc_job(
+            &self,
+            tc: Toolchain,
+            _: dist::CommandHash,
+        ) -> Result<AllocJobResult> {
             assert!(
                 !self
                     .has_started
@@ -4139,7 +4154,11 @@ mod test_dist {
 
     #[async_trait]
     impl dist::Client for OneshotClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+        async fn do_alloc_job(
+            &self,
+            tc: Toolchain,
+            _: dist::CommandHash,
+        ) -> Result<AllocJobResult> {
             assert!(
                 !self
                     .has_started

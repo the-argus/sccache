@@ -67,12 +67,14 @@ pub enum Command {
     DistStatus,
     /// Perform a login to authenticate for distributed compilation.
     DistAuth,
-    /// Print name, CPU count and max_jobs of a locally running build server,
-    /// optionally set max_jobs as well
+    /// Print name, CPU count, max_jobs and max_memory of a locally running
+    /// build server, optionally set max_jobs or max_memory as well
     DistBuilderInfo {
         /// override dist_control_address from the client config
         dist_control_address: Option<SocketAddr>,
         set_max_jobs: Option<usize>,
+        /// Some(None) means no limit
+        set_max_memory: Option<Option<u64>>,
     },
     /// Package a toolchain for distributed compilation (executable, out)
     PackageToolchain(PathBuf, PathBuf),
@@ -159,12 +161,16 @@ fn get_clap_command() -> clap::Command {
                 .help("show status of the distributed client")
                 .action(ArgAction::SetTrue),
             flag_infer_long("dist-builder-info")
-                .help("show name, CPU count and max_jobs of the dist build server on this machine")
+                .help("show name, CPU count, max_jobs and max_memory of the dist build server on this machine")
                 .action(ArgAction::SetTrue),
             flag_infer_long("dist-builder-max-jobs")
                 .help("set max_jobs of the dist build server running on this machine")
                 .value_name("N")
                 .value_parser(clap::value_parser!(usize)),
+            flag_infer_long("dist-builder-max-memory")
+                .help("set max_memory of the dist build server running on this machine, for example 16G. no argument is interpreted as \"unlimited\"")
+                .value_name("SIZE")
+                .value_parser(parse_max_memory),
             flag_infer_long("dist-control-address")
                 .help("dist control address of the build server, overrides the client config")
                 .value_name("ADDRESS")
@@ -193,6 +199,7 @@ fn get_clap_command() -> clap::Command {
                     "dist-status",
                     "dist-builder-info",
                     "dist-builder-max-jobs",
+                    "dist-builder-max-memory",
                     "show-stats",
                     "show-adv-stats",
                     "start-server",
@@ -205,14 +212,30 @@ fn get_clap_command() -> clap::Command {
         )
         .group(
             ArgGroup::new("dist_builder_command")
-                .args(["dist-builder-info", "dist-builder-max-jobs"]),
+                .args([
+                    "dist-builder-info",
+                    "dist-builder-max-jobs",
+                    "dist-builder-max-memory",
+                ]),
         )
+}
+
+fn parse_max_memory(value: &str) -> std::result::Result<Option<u64>, String> {
+    if value == "none" {
+        return Ok(None);
+    }
+    crate::config::parse_size(value)
+        .map(Some)
+        .ok_or_else(|| format!("invalid size {value:?}"))
 }
 
 fn dist_builder_info_command(matches: &ArgMatches) -> Command {
     Command::DistBuilderInfo {
         dist_control_address: matches.get_one("dist-control-address").copied(),
         set_max_jobs: matches.get_one("dist-builder-max-jobs").copied(),
+        set_max_memory: matches
+            .get_one::<Option<u64>>("dist-builder-max-memory")
+            .copied(),
     }
 }
 
@@ -389,6 +412,7 @@ mod tests {
             Ok(Command::DistBuilderInfo {
                 dist_control_address: None,
                 set_max_jobs: None,
+                set_max_memory: None,
             })
         ));
 
@@ -403,12 +427,50 @@ mod tests {
             Ok(Command::DistBuilderInfo {
                 dist_control_address,
                 set_max_jobs,
+                set_max_memory,
             }) => {
                 assert_eq!(dist_control_address, Some(address));
                 assert_eq!(set_max_jobs, Some(0));
+                assert_eq!(set_max_memory, None);
             }
             _ => panic!("expected DistBuilderInfo"),
         }
+
+        assert!(matches!(
+            parse(&["sccache", "--dist-builder-max-memory", "16G"]),
+            Ok(Command::DistBuilderInfo {
+                dist_control_address: None,
+                set_max_jobs: None,
+                set_max_memory: Some(Some(17179869184)),
+            })
+        ));
+        assert!(matches!(
+            parse(&["sccache", "--dist-builder-max-memory", "1048576"]),
+            Ok(Command::DistBuilderInfo {
+                set_max_memory: Some(Some(1048576)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["sccache", "--dist-builder-max-memory", "none"]),
+            Ok(Command::DistBuilderInfo {
+                set_max_memory: Some(None),
+                ..
+            })
+        ));
+        assert!(parse(&["sccache", "--dist-builder-max-memory", "None"]).is_err());
+        assert!(parse(&["sccache", "--dist-builder-max-memory", "lots"]).is_err());
+        assert!(parse(&["sccache", "--dist-builder-max-memory", "-1G"]).is_err());
+        assert!(
+            parse(&[
+                "sccache",
+                "--dist-builder-max-jobs",
+                "2",
+                "--dist-builder-max-memory",
+                "1G"
+            ])
+            .is_err()
+        );
 
         assert!(parse(&["sccache", "--dist-builder-max-jobs", "-1"]).is_err());
         assert!(parse(&["sccache", "--dist-control-address", "127.0.0.1:20502"]).is_err());

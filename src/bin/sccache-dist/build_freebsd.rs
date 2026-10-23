@@ -393,6 +393,7 @@ impl PotBuilder {
         Ok(BuildResult {
             output: compile_output,
             outputs,
+            peak_memory: None,
         })
     }
 }

@@ -366,6 +366,28 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+// hash to identify a compilation based on factors that affect how much memory it uses, so as to
+// predict how much a new compilation is going to take based on previous compilations of the same
+// hash
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CommandHash(#[serde(deserialize_with = "deserialize_archive_id")] String);
+impl CommandHash {
+    #[cfg(feature = "dist-client")]
+    pub fn new(command: &CompileCommand, toolchain: &Toolchain) -> Result<Self> {
+        let CompileCommand {
+            executable,
+            arguments,
+            // environment variables shouldn't really affect memory usage
+            env_vars: _,
+            cwd,
+        } = command;
+        let bytes = bincode::serialize(&(executable, arguments, cwd, &toolchain.archive_id))
+            .context("Failed to serialize the compile command for hashing")?;
+        Ok(CommandHash(blake3::hash(&bytes).to_hex().to_string()))
+    }
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobId(pub u64);
@@ -412,7 +434,6 @@ pub enum JobState {
     Pending,
     Ready,
     Started,
-    Complete,
 }
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -421,7 +442,6 @@ impl fmt::Display for JobState {
             Pending => "pending",
             Ready => "ready",
             Started => "started",
-            Complete => "complete",
         }
         .fmt(f)
     }
@@ -575,7 +595,15 @@ pub struct HeartbeatServerResult {
 pub struct BuilderInfo {
     pub name: String,
     pub num_cpus: usize,
+    pub limits: BuilderLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderLimits {
     pub max_jobs: usize,
+    // none disables memory limits
+    pub max_memory: Option<u64>,
 }
 
 // RunJob
@@ -601,6 +629,14 @@ pub struct SchedulerStatusResult {
     pub num_servers: usize,
     pub num_cpus: usize,
     pub in_progress: usize,
+    pub servers: Vec<ServerStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerStatus {
+    pub server_id: ServerId,
+    pub info: BuilderInfo,
 }
 
 // SubmitToolchain
@@ -620,6 +656,8 @@ pub enum SubmitToolchainResult {
 pub struct BuildResult {
     pub output: ProcessOutput,
     pub outputs: Vec<(String, OutputData)>,
+    // in bytes, may be None if it couldn't be conclusively measured
+    pub peak_memory: Option<u64>,
 }
 
 ///////////////////
@@ -637,6 +675,11 @@ impl Read for ToolchainReader<'_> {
 }
 
 pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
+impl<'a> InputsReader<'a> {
+    pub fn new(reader: impl Read + Send + 'a) -> Self {
+        InputsReader(Box::new(reader))
+    }
+}
 impl Read for InputsReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
@@ -662,6 +705,11 @@ pub trait SchedulerOutgoing {
 pub trait ServerOutgoing {
     // To Scheduler
     fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
+    fn do_complete_job(
+        &self,
+        job_id: JobId,
+        peak_memory: Option<u64>,
+    ) -> Result<UpdateJobStateResult>;
 }
 
 // Trait to handle the creation and verification of job authorization tokens
@@ -678,6 +726,8 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
+        command_hash: CommandHash,
+        client_name: String,
     ) -> ExtResult<AllocJobResult, Error>;
     // From Server
     fn handle_heartbeat_server(
@@ -693,6 +743,13 @@ pub trait SchedulerIncoming: Send + Sync {
         job_id: JobId,
         server_id: ServerId,
         job_state: JobState,
+    ) -> ExtResult<UpdateJobStateResult, Error>;
+    // From Server
+    fn handle_complete_job(
+        &self,
+        job_id: JobId,
+        server_id: ServerId,
+        peak_memory: Option<u64>,
     ) -> ExtResult<UpdateJobStateResult, Error>;
     // From anyone
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
@@ -737,7 +794,11 @@ pub trait BuilderIncoming: Send + Sync {
 #[async_trait]
 pub trait Client: Send + Sync {
     // To Scheduler
-    async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult>;
+    async fn do_alloc_job(
+        &self,
+        tc: Toolchain,
+        command_hash: CommandHash,
+    ) -> Result<AllocJobResult>;
     // To Scheduler
     async fn do_get_status(&self) -> Result<SchedulerStatusResult>;
     // To Server

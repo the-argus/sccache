@@ -2,7 +2,7 @@ use fs_err as fs;
 use log::trace;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 use sccache::config::HTTPUrl;
-use sccache::dist::{self, SchedulerStatusResult, ServerId};
+use sccache::dist::{self, BuilderLimits, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 use std::env;
 use std::fs::remove_dir_all;
@@ -191,6 +191,7 @@ pub fn sccache_client_cfg(
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
             dist_control_address: sccache::config::DEFAULT_DIST_CONTROL_ADDRESS,
+            name: None,
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
@@ -206,6 +207,10 @@ fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
         server_auth: sccache::config::scheduler::ServerAuth::Token {
             token: DIST_SERVER_TOKEN.to_owned(),
         },
+        memory_history_path: Path::new(CONFIGS_CONTAINER_PATH)
+            .join("scheduler-memory-history.json"),
+        memory_history_max_entries: sccache::config::scheduler::default_memory_history_max_entries(
+        ),
     }
 }
 
@@ -234,6 +239,7 @@ fn sccache_server_cfg(
         toolchain_cache_size: TC_CACHE_SIZE,
         name: None,
         max_jobs: sccache::config::server::default_max_jobs(),
+        max_memory: sccache::config::server::default_max_memory(),
         dist_control_address,
     }
 }
@@ -402,7 +408,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 0,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        servers: _,
                     }
                 ) {
                     Ok(())
@@ -505,6 +512,7 @@ impl DistSystem {
             token,
             "custom-server".to_owned(),
             sccache::config::server::default_max_jobs(),
+            sccache::config::server::default_max_memory(),
             dist_control_address,
             handler,
         )
@@ -589,7 +597,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 1,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        servers: _,
                     }
                 ) {
                     Ok(())
@@ -605,6 +614,26 @@ impl DistSystem {
     pub fn scheduler_url(&self) -> HTTPUrl {
         let url = format!("http://127.0.0.1:{}", SCHEDULER_PORT);
         HTTPUrl::from_url(reqwest::Url::parse(&url).unwrap())
+    }
+
+    // evaluate the BuilderLimits reported until predicate expected() returns true
+    pub fn wait_for_builder_limits(&self, expected: impl Fn(&BuilderLimits) -> bool) {
+        wait_for(
+            || {
+                let status = self.scheduler_status();
+                if status
+                    .servers
+                    .iter()
+                    .any(|server| expected(&server.info.limits))
+                {
+                    Ok(())
+                } else {
+                    Err(format!("{:?}", status))
+                }
+            },
+            Duration::from_millis(100),
+            MAX_STARTUP_WAIT,
+        );
     }
 
     fn scheduler_status(&self) -> SchedulerStatusResult {

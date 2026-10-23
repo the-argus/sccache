@@ -93,6 +93,8 @@ static CACHED_CONFIG: Mutex<Option<CachedFileConfig>> = Mutex::new(None);
 const ORGANIZATION: &str = "Mozilla";
 const APP_NAME: &str = "sccache";
 const DIST_APP_NAME: &str = "sccache-dist-client";
+#[cfg(feature = "dist-server")]
+const DIST_SCHEDULER_APP_NAME: &str = "sccache-dist-scheduler";
 const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 
 pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
@@ -113,6 +115,13 @@ pub fn default_disk_cache_dir() -> PathBuf {
 pub fn default_dist_cache_dir() -> PathBuf {
     ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME)
         .expect("Unable to retrieve dist cache directory")
+        .cache_dir()
+        .to_owned()
+}
+#[cfg(feature = "dist-server")]
+pub fn default_dist_scheduler_cache_dir() -> PathBuf {
+    ProjectDirs::from("", ORGANIZATION, DIST_SCHEDULER_APP_NAME)
+        .expect("Unable to retrieve dist scheduler cache directory")
         .cache_dir()
         .to_owned()
 }
@@ -777,6 +786,7 @@ pub struct DistConfig {
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
     pub dist_control_address: std::net::SocketAddr,
+    pub name: Option<String>, // defaults to hostname
 }
 
 impl Default for DistConfig {
@@ -789,6 +799,7 @@ impl Default for DistConfig {
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
             dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
+            name: None,
         }
     }
 }
@@ -1534,7 +1545,7 @@ impl CachedConfig {
 #[cfg(feature = "dist-server")]
 pub mod scheduler {
     use std::net::SocketAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use crate::errors::*;
 
@@ -1573,12 +1584,24 @@ pub mod scheduler {
         Token { token: String },
     }
 
+    pub fn default_memory_history_path() -> PathBuf {
+        super::default_dist_scheduler_cache_dir().join("memory-history.json")
+    }
+
+    pub fn default_memory_history_max_entries() -> usize {
+        100_000
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
         pub public_addr: SocketAddr,
         pub client_auth: ClientAuth,
         pub server_auth: ServerAuth,
+        #[serde(default = "default_memory_history_path")]
+        pub memory_history_path: PathBuf,
+        #[serde(default = "default_memory_history_max_entries")]
+        pub memory_history_max_entries: usize,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -1611,6 +1634,36 @@ pub mod server {
 
     fn default_dist_control_address() -> SocketAddr {
         super::DEFAULT_DIST_CONTROL_ADDRESS
+    }
+
+    pub fn default_max_memory() -> Option<u64> {
+        if cfg!(target_os = "linux") {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+            parse_available_memory(&meminfo)
+        } else {
+            None
+        }
+    }
+
+    // get MemAvailable from /proc/meminfo in bytes.
+    pub fn parse_available_memory(meminfo: &str) -> Option<u64> {
+        let line = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+        let kibibytes = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+        kibibytes.checked_mul(1024)
+    }
+
+    // this one accepts a missing value and considers it to be a disabled memory limit
+    fn deserialize_optional_size<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<u64>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Size(#[serde(deserialize_with = "super::deserialize_size_from_str")] u64);
+        Ok(Option::<Size>::deserialize(deserializer)?.map(|Size(size)| size))
     }
 
     const DEFAULT_POT_CLONE_FROM: &str = "sccache-template";
@@ -1688,6 +1741,11 @@ pub mod server {
         pub name: Option<String>,
         #[serde(default = "default_max_jobs")]
         pub max_jobs: usize,
+        #[serde(
+            default = "default_max_memory",
+            deserialize_with = "deserialize_optional_size"
+        )]
+        pub max_memory: Option<u64>,
         #[serde(default = "default_dist_control_address")]
         pub dist_control_address: SocketAddr,
     }
@@ -2884,6 +2942,8 @@ toolchain_cache_size = 5368709120
 cache_dir = "/home/user/.cache/sccache-dist-client"
 # local endpoint for the CLI to communicate with a locally running server
 dist_control_address = "127.0.0.1:20502"
+# the name of this machine as a client of the scheduler
+name = "workstation-1"
 
 [dist.auth]
 type = "token"
@@ -3068,6 +3128,7 @@ key_prefix = "cosprefix"
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
                 dist_control_address: "127.0.0.1:20502".parse().unwrap(),
+                name: Some("workstation-1".to_owned()),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3094,6 +3155,7 @@ fn server_toml_parse() {
     # The URL used to connect to the scheduler (should use https, given an ideal
     # setup of a HTTPS server in front of the scheduler)
     scheduler_url = "https://192.168.1.1"
+    max_memory = "8G"
 
     [builder]
     type = "overlay"
@@ -3136,6 +3198,7 @@ fn server_toml_parse() {
             toolchain_cache_size: 10737418240,
             name: None,
             max_jobs: server::default_max_jobs(),
+            max_memory: Some(8 * 1024 * 1024 * 1024),
             dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
         }
     )
@@ -3166,6 +3229,114 @@ fn server_toml_parse_builder_settings() {
         server_config.dist_control_address,
         "127.0.0.1:20502".parse::<std::net::SocketAddr>().unwrap()
     );
+}
+
+#[test]
+#[cfg(feature = "dist-server")]
+fn server_toml_parse_max_memory() {
+    const CONFIG_STR: &str = r#"
+    cache_dir = "/tmp/toolchains"
+    public_addr = "192.168.1.1:10501"
+    scheduler_url = "https://192.168.1.1"
+
+    [builder]
+    type = "docker"
+
+    [scheduler_auth]
+    type = "DANGEROUSLY_INSECURE"
+    "#;
+
+    let parse = |max_memory: &str| -> Option<u64> {
+        let config_string = format!("{max_memory}\n{CONFIG_STR}");
+        let server_config: server::Config = toml::from_str(&config_string).expect("Is valid toml.");
+        server_config.max_memory
+    };
+    assert_eq!(
+        parse(r#"max_memory = "16G""#),
+        Some(16 * 1024 * 1024 * 1024)
+    );
+    assert_eq!(parse(r#"max_memory = "512M""#), Some(512 * 1024 * 1024));
+    assert_eq!(parse("max_memory = 1073741824"), Some(1024 * 1024 * 1024));
+    if cfg!(target_os = "linux") {
+        assert!(parse("").is_some_and(|max_memory| max_memory > 0));
+    } else {
+        assert_eq!(parse(""), None);
+    }
+    assert!(
+        toml::from_str::<server::Config>(&format!("max_memory = \"lots\"\n{CONFIG_STR}")).is_err()
+    );
+
+    // disable limit with server config
+    let server_config: server::Config = serde_json::from_str(
+        r#"{
+            "builder": {"type": "docker"},
+            "cache_dir": "/tmp/toolchains",
+            "public_addr": "192.168.1.1:10501",
+            "scheduler_url": "https://192.168.1.1",
+            "scheduler_auth": {"type": "DANGEROUSLY_INSECURE"},
+            "max_memory": null
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(server_config.max_memory, None);
+}
+
+#[test]
+#[cfg(feature = "dist-server")]
+fn parse_available_memory_from_meminfo() {
+    const MEMINFO: &str = "\
+MemTotal:       65536000 kB
+MemFree:         1234567 kB
+MemAvailable:   40000000 kB
+";
+    assert_eq!(
+        server::parse_available_memory(MEMINFO),
+        Some(40000000 * 1024)
+    );
+    assert_eq!(server::parse_available_memory("MemFree: 1 kB\n"), None);
+    assert_eq!(
+        server::parse_available_memory("MemAvailable: many kB\n"),
+        None
+    );
+
+    assert_eq!(server::parse_available_memory("MemAvailable: 1024\n"), None);
+    assert_eq!(
+        server::parse_available_memory("MemFree:  1 kB\nMemAvailable:\t 2 kB\n"),
+        Some(2048)
+    );
+}
+
+#[test]
+#[cfg(feature = "dist-server")]
+fn scheduler_toml_parse_memory_history() {
+    const CONFIG_STR: &str = r#"
+    public_addr = "127.0.0.1:10600"
+
+    [client_auth]
+    type = "DANGEROUSLY_INSECURE"
+
+    [server_auth]
+    type = "DANGEROUSLY_INSECURE"
+    "#;
+    let scheduler_config: scheduler::Config = toml::from_str(CONFIG_STR).unwrap();
+    assert_eq!(
+        scheduler_config.memory_history_path,
+        scheduler::default_memory_history_path()
+    );
+    assert_eq!(
+        scheduler_config.memory_history_max_entries,
+        scheduler::default_memory_history_max_entries()
+    );
+
+    let scheduler_config: scheduler::Config = toml::from_str(&format!(
+        "memory_history_path = \"/var/lib/sccache/history.json\"\nmemory_history_max_entries = 10\n{CONFIG_STR}"
+    ))
+    .unwrap();
+    assert_eq!(
+        scheduler_config.memory_history_path,
+        PathBuf::from("/var/lib/sccache/history.json")
+    );
+    assert_eq!(scheduler_config.memory_history_max_entries, 10);
 }
 
 #[test]

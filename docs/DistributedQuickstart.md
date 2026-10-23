@@ -100,7 +100,7 @@ sudo sccache-dist server --config server.conf
 
 As with the scheduler, if the build server fails to start you may need to set `SCCACHE_LOG=trace` to get useful diagnostics.
 
-It is possible to set a job limit for a server, see [the server configuration docs](Distributed.md#servertoml).
+It is possible to set a job and memory limit for a server, see [the server configuration docs](Distributed.md#servertoml).
 
 Configure a client
 ------------------
@@ -145,7 +145,7 @@ You can check the status with `sccache --dist-status`, it should say something l
 
 ```
 $ sccache --dist-status
-{"SchedulerStatus":["https://sccache1.corpdmz.ber3.mozilla.com/",{"num_servers":3,"num_cpus":56,"in_progress":24}]}
+{"SchedulerStatus":["https://sccache1.corpdmz.ber3.mozilla.com/",{"num_servers":1,"num_cpus":16,"in_progress":4,"servers":[{"server_id":"192.168.1.1:10501","info":{"name":"builder-1","num_cpus":16,"limits":{"max_jobs":19,"max_memory":68719476736}}}]}]}
 ```
 
 Using custom toolchains

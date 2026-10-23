@@ -241,6 +241,7 @@ unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
   "flate2",
+  "hostname",
   "hyper",
   "http-body-util",
   "hyper-util",
