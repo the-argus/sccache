@@ -97,6 +97,10 @@ const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 
 pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
 
+pub const DEFAULT_DIST_CONTROL_ADDRESS: std::net::SocketAddr = std::net::SocketAddr::V4(
+    std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 10502),
+);
+
 // Unfortunately this means that nothing else can use the sccache cache dir as
 // this top level directory is used directly to store sccache cached objects...
 pub fn default_disk_cache_dir() -> PathBuf {
@@ -772,6 +776,7 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    pub dist_control_address: std::net::SocketAddr,
 }
 
 impl Default for DistConfig {
@@ -783,6 +788,7 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
         }
     }
 }
@@ -1594,6 +1600,19 @@ pub mod server {
         TEN_GIGS
     }
 
+    pub fn default_max_jobs() -> usize {
+        // Oversubscribe cores just a little to make up for network and I/O latency. This formula is
+        // not based on hard data but an extrapolation to high core counts of the conventional wisdom
+        // that slightly more jobs than cores achieve the shortest compile time. Which is originally
+        // about local compiles and this is over the network, so be slightly less conservative.
+        let cores = crate::util::num_cpus();
+        cores + 1 + cores / 8
+    }
+
+    fn default_dist_control_address() -> SocketAddr {
+        super::DEFAULT_DIST_CONTROL_ADDRESS
+    }
+
     const DEFAULT_POT_CLONE_FROM: &str = "sccache-template";
     const DEFAULT_POT_FS_ROOT: &str = "/opt/pot";
     const DEFAULT_POT_CMD: &str = "pot";
@@ -1665,6 +1684,12 @@ pub mod server {
         pub scheduler_auth: SchedulerAuth,
         #[serde(default = "default_toolchain_cache_size")]
         pub toolchain_cache_size: u64,
+        // or else hostname
+        pub name: Option<String>,
+        #[serde(default = "default_max_jobs")]
+        pub max_jobs: usize,
+        #[serde(default = "default_dist_control_address")]
+        pub dist_control_address: SocketAddr,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -2857,6 +2882,8 @@ toolchains = []
 # the maximum size of the toolchain cache in bytes
 toolchain_cache_size = 5368709120
 cache_dir = "/home/user/.cache/sccache-dist-client"
+# local endpoint for the CLI to communicate with a locally running server
+dist_control_address = "127.0.0.1:20502"
 
 [dist.auth]
 type = "token"
@@ -3040,6 +3067,7 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                dist_control_address: "127.0.0.1:20502".parse().unwrap(),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3106,8 +3134,38 @@ fn server_toml_parse() {
                 token: "my server's token".to_owned()
             },
             toolchain_cache_size: 10737418240,
+            name: None,
+            max_jobs: server::default_max_jobs(),
+            dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
         }
     )
+}
+
+#[test]
+#[cfg(feature = "dist-server")]
+fn server_toml_parse_builder_settings() {
+    const CONFIG_STR: &str = r#"
+    cache_dir = "/tmp/toolchains"
+    public_addr = "192.168.1.1:10501"
+    scheduler_url = "https://192.168.1.1"
+    name = "builder-a"
+    max_jobs = 3
+    dist_control_address = "127.0.0.1:20502"
+
+    [builder]
+    type = "docker"
+
+    [scheduler_auth]
+    type = "DANGEROUSLY_INSECURE"
+    "#;
+
+    let server_config: server::Config = toml::from_str(CONFIG_STR).expect("Is valid toml.");
+    assert_eq!(server_config.name.as_deref(), Some("builder-a"));
+    assert_eq!(server_config.max_jobs, 3);
+    assert_eq!(
+        server_config.dist_control_address,
+        "127.0.0.1:20502".parse::<std::net::SocketAddr>().unwrap()
+    );
 }
 
 #[test]

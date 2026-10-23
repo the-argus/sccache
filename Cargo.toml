@@ -124,6 +124,7 @@ zip = { version = "0.6", default-features = false }
 zstd = "0.13"
 
 # dist-server only
+hostname = { version = "0.4", optional = true }
 nix = { version = "0.30.0", optional = true, features = [
   "mount",
   "user",
@@ -251,6 +252,7 @@ dist-client = [
 dist-server = [
   "jwt",
   "flate2",
+  "hostname",
   "libmount",
   "nix",
   "openssl",

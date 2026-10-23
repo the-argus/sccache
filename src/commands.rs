@@ -951,6 +951,26 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             println!();
         }
         #[cfg(feature = "dist-client")]
+        Command::DistBuilderInfo {
+            dist_control_address,
+            set_max_jobs,
+        } => {
+            trace!("Command::DistBuilderInfo");
+            let dist_control_address =
+                dist_control_address.unwrap_or(config.dist.dist_control_address);
+            let builder_info =
+                crate::dist::http::request_dist_control(dist_control_address, set_max_jobs)?;
+            serde_json::to_writer(&mut io::stdout(), &builder_info)?;
+            println!();
+        }
+        #[cfg(not(feature = "dist-client"))]
+        Command::DistBuilderInfo {
+            dist_control_address: _dist_control_address,
+            set_max_jobs: _set_max_jobs,
+        } => {
+            bail!("Distributed compilation not enabled in this build, requires dist-client feature")
+        }
+        #[cfg(feature = "dist-client")]
         Command::PackageToolchain(executable, out) => {
             use crate::compiler;
 

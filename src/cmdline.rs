@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::errors::*;
-use clap::{Arg, ArgAction, ArgGroup, ValueEnum, error::ErrorKind};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, ValueEnum, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use which::which_in;
@@ -66,6 +67,13 @@ pub enum Command {
     DistStatus,
     /// Perform a login to authenticate for distributed compilation.
     DistAuth,
+    /// Print name, CPU count and max_jobs of a locally running build server,
+    /// optionally set max_jobs as well
+    DistBuilderInfo {
+        /// override dist_control_address from the client config
+        dist_control_address: Option<SocketAddr>,
+        set_max_jobs: Option<usize>,
+    },
     /// Package a toolchain for distributed compilation (executable, out)
     PackageToolchain(PathBuf, PathBuf),
     /// Run a compiler command.
@@ -150,6 +158,18 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("dist-status")
                 .help("show status of the distributed client")
                 .action(ArgAction::SetTrue),
+            flag_infer_long("dist-builder-info")
+                .help("show name, CPU count and max_jobs of the dist build server on this machine")
+                .action(ArgAction::SetTrue),
+            flag_infer_long("dist-builder-max-jobs")
+                .help("set max_jobs of the dist build server running on this machine")
+                .value_name("N")
+                .value_parser(clap::value_parser!(usize)),
+            flag_infer_long("dist-control-address")
+                .help("dist control address of the build server, overrides the client config")
+                .value_name("ADDRESS")
+                .value_parser(clap::value_parser!(SocketAddr))
+                .requires("dist_builder_command"),
             flag_infer_long("package-toolchain")
                 .help("package toolchain for distributed compilation")
                 .value_parser(clap::value_parser!(PathBuf))
@@ -171,6 +191,8 @@ fn get_clap_command() -> clap::Command {
                     "dist-auth",
                     "debug-preprocessor-cache",
                     "dist-status",
+                    "dist-builder-info",
+                    "dist-builder-max-jobs",
                     "show-stats",
                     "show-adv-stats",
                     "start-server",
@@ -181,6 +203,17 @@ fn get_clap_command() -> clap::Command {
                 ])
                 .required(true),
         )
+        .group(
+            ArgGroup::new("dist_builder_command")
+                .args(["dist-builder-info", "dist-builder-max-jobs"]),
+        )
+}
+
+fn dist_builder_info_command(matches: &ArgMatches) -> Command {
+    Command::DistBuilderInfo {
+        dist_control_address: matches.get_one("dist-control-address").copied(),
+        set_max_jobs: matches.get_one("dist-builder-max-jobs").copied(),
+    }
 }
 
 /// Parse the commandline args into a `Result<Command>` to execute.
@@ -283,6 +316,8 @@ pub fn try_parse() -> Result<Command> {
                 Ok(Command::DistAuth)
             } else if matches.get_flag("dist-status") {
                 Ok(Command::DistStatus)
+            } else if matches.contains_id("dist_builder_command") {
+                Ok(dist_builder_info_command(&matches))
             } else if matches.contains_id("package-toolchain") {
                 let mut toolchain_values = matches
                     .get_many("package-toolchain")
@@ -334,5 +369,57 @@ pub fn try_parse() -> Result<Command> {
                 unreachable!("Either the arg group or env variable should provide a command");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> clap::error::Result<Command> {
+        get_clap_command()
+            .try_get_matches_from(arguments)
+            .map(|matches| dist_builder_info_command(&matches))
+    }
+
+    #[test]
+    fn dist_builder_info_arguments() {
+        assert!(matches!(
+            parse(&["sccache", "--dist-builder-info"]),
+            Ok(Command::DistBuilderInfo {
+                dist_control_address: None,
+                set_max_jobs: None,
+            })
+        ));
+
+        let address: SocketAddr = "127.0.0.1:20502".parse().unwrap();
+        match parse(&[
+            "sccache",
+            "--dist-builder-max-jobs",
+            "0",
+            "--dist-control-address",
+            "127.0.0.1:20502",
+        ]) {
+            Ok(Command::DistBuilderInfo {
+                dist_control_address,
+                set_max_jobs,
+            }) => {
+                assert_eq!(dist_control_address, Some(address));
+                assert_eq!(set_max_jobs, Some(0));
+            }
+            _ => panic!("expected DistBuilderInfo"),
+        }
+
+        assert!(parse(&["sccache", "--dist-builder-max-jobs", "-1"]).is_err());
+        assert!(parse(&["sccache", "--dist-control-address", "127.0.0.1:20502"]).is_err());
+        assert!(
+            parse(&[
+                "sccache",
+                "--dist-builder-info",
+                "--dist-builder-max-jobs",
+                "2"
+            ])
+            .is_err()
+        );
     }
 }

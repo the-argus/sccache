@@ -367,6 +367,15 @@ public_addr = "192.168.1.1:10501"
 # The URL used to connect to the scheduler (should use https, given an ideal
 # setup of a HTTPS server in front of the scheduler)
 scheduler_url = "https://192.168.1.1"
+# this name is sent to the scheduler to identify this builder. It should be
+# unique among all builders under the scheduler, in case a user wants to refer
+# to specific other machines in a build cluster. default value is hostname
+#name = "builder-1"
+# max jobs that can be assigned, default is cores + 1 + cores / 8
+#max_jobs = 17
+# local address that is used for sccache CLI to communicate with a locally
+# running build server
+#dist_control_address = "127.0.0.1:10502"
 
 [builder]
 type = "overlay"
@@ -427,6 +436,34 @@ token = "preshared token"
 type = "DANGEROUSLY_INSECURE"
 ```
 
+
+#### Changing max_jobs at runtime
+
+A builder's `max_jobs` can be changed while it is running. This is an ephemeral
+change, so the builder returns to the value from the config file when it
+restarts. This is useful for developers who are sharing cores of their personal
+machines with each other. When a personal machine is a build server like this,
+it can be useful to limit the compute that sccache will use when doing other
+computationally expensive tasks.
+
+Note that setting max jobs only affects future scheduling decisions and will
+never cause jobs to be killed.
+
+To set max jobs, use the `sccache` CLI (`dist-client` feature must have been
+enabled during build):
+
+```
+# print name, number of CPUs, and max jobs according to the local build server
+sccache --dist-builder-info
+# set the number of max jobs to 4 and then also print stats afterwards like
+# --dist-builder-info does
+sccache --dist-builder-max-jobs 4
+# override the dist control address from the one in the client config
+sccache --dist-builder-info --dist-control-address 127.0.0.1:20502
+```
+
+The dist control is meant to be a replacement for a socket, so it only works
+with a loopback address.
 
 # Building the Distributed Server Binaries
 

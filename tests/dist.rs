@@ -7,7 +7,7 @@ extern crate serde_json;
 
 use crate::harness::{
     cargo_command, clear_cache_local_daemon, get_stats, init_cargo, sccache_command,
-    start_local_daemon, stop_local_daemon, write_json_cfg, write_source,
+    start_local_daemon, stop_local_daemon, write_json_cfg, write_source, zero_stats,
 };
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
@@ -15,9 +15,11 @@ use sccache::dist::{
     AssignJobResult, CompileCommand, InputsReader, JobId, JobState, RunJobResult, ServerIncoming,
     ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
 };
+use sccache::server::ServerInfo;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Output;
+use std::time::{Duration, Instant};
 
 use sccache::errors::*;
 
@@ -242,6 +244,96 @@ fn test_dist_restartedserver() {
         assert_eq!(0, info.stats.cache_hits.all());
         assert_eq!(2, info.stats.cache_misses.all());
     });
+}
+
+fn set_builder_max_jobs(sccache_config_path: &Path, max_jobs: usize, extra_arguments: &[String]) {
+    sccache_command()
+        .arg("--dist-builder-max-jobs")
+        .arg(max_jobs.to_string())
+        .args(extra_arguments)
+        .env("SCCACHE_CONF", sccache_config_path)
+        .assert()
+        .success();
+}
+
+fn compile_until_dist_stats(
+    tmpdir: &Path,
+    sccache_cfg_path: &Path,
+    sccache_cached_cfg_path: &Path,
+    expected_dist_compiles: usize,
+    expected_dist_errors: u64,
+) {
+    let start = Instant::now();
+    loop {
+        zero_stats();
+        basic_compile(tmpdir, sccache_cfg_path, sccache_cached_cfg_path);
+        let output = sccache_command()
+            .args(["--show-stats", "--stats-format=json"])
+            .output()
+            .unwrap();
+        let info: ServerInfo = serde_json::from_slice(&output.stdout).unwrap();
+        let dist_compiles = info.stats.dist_compiles.values().sum::<usize>();
+        let dist_errors = info.stats.dist_errors;
+        if (dist_compiles, dist_errors) == (expected_dist_compiles, expected_dist_errors) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "expected {expected_dist_compiles} dist compiles and {expected_dist_errors} dist errors, got {dist_compiles} and {dist_errors}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_max_jobs_via_dist_control() {
+    let temporary_directory = tempfile::Builder::new()
+        .prefix("sccache_dist_test")
+        .tempdir()
+        .unwrap();
+    let temporary_directory = temporary_directory.path();
+    let sccache_dist = harness::sccache_dist_path();
+
+    let mut system = harness::DistSystem::new(&sccache_dist, temporary_directory);
+    system.add_scheduler();
+    let server_handle = system.add_server();
+
+    let mut sccache_config =
+        dist_test_sccache_client_cfg(temporary_directory, system.scheduler_url());
+    sccache_config.dist.dist_control_address = server_handle.dist_control_address();
+    let sccache_config_path = temporary_directory.join("sccache-cfg.json");
+    write_json_cfg(temporary_directory, "sccache-cfg.json", &sccache_config);
+    let sccache_cached_config_path = temporary_directory.join("sccache-cached-cfg");
+
+    stop_local_daemon();
+    start_local_daemon(&sccache_config_path, &sccache_cached_config_path);
+
+    // use default dist control address which is what is in the config
+    set_builder_max_jobs(&sccache_config_path, 0, &[]);
+    compile_until_dist_stats(
+        temporary_directory,
+        &sccache_config_path,
+        &sccache_cached_config_path,
+        0,
+        1,
+    );
+
+    // override the dist control address
+    set_builder_max_jobs(
+        &sccache_config_path,
+        1,
+        &[
+            "--dist-control-address".to_owned(),
+            server_handle.dist_control_address().to_string(),
+        ],
+    );
+    compile_until_dist_stats(
+        temporary_directory,
+        &sccache_config_path,
+        &sccache_cached_config_path,
+        1,
+        0,
+    );
 }
 
 #[test]

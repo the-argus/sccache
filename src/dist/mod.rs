@@ -570,6 +570,14 @@ pub struct HeartbeatServerResult {
     pub is_new: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderInfo {
+    pub name: String,
+    pub num_cpus: usize,
+    pub max_jobs: usize,
+}
+
 // RunJob
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -676,7 +684,7 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         server_id: ServerId,
         server_nonce: ServerNonce,
-        num_cpus: usize,
+        info: BuilderInfo,
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server

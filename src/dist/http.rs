@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #[cfg(feature = "dist-client")]
-pub use self::client::Client;
+pub use self::client::{Client, request_dist_control};
+pub use self::common::SetMaxJobsLocalHttpRequest;
 #[cfg(feature = "dist-server")]
 pub use self::server::Server;
 #[cfg(feature = "dist-server")]
@@ -146,7 +147,7 @@ mod common {
     #[serde(deny_unknown_fields)]
     pub struct HeartbeatServerHttpRequest {
         pub jwt_key: Vec<u8>,
-        pub num_cpus: usize,
+        pub info: dist::BuilderInfo,
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
@@ -157,7 +158,7 @@ mod common {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("HeartbeatServerHttpRequest")
                 .field("jwt_key", &BASE64_URL_SAFE_ENGINE.encode(&self.jwt_key))
-                .field("num_cpus", &self.num_cpus)
+                .field("info", &self.info)
                 .field("server_nonce", &self.server_nonce)
                 .field(
                     "cert_digest",
@@ -172,10 +173,17 @@ mod common {
         pub command: dist::CompileCommand,
         pub outputs: Vec<String>,
     }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SetMaxJobsLocalHttpRequest {
+        pub max_jobs: usize,
+    }
 }
 
 pub mod urls {
     use crate::dist::{JobId, ServerId};
+    use std::net::SocketAddr;
 
     pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> reqwest::Url {
         scheduler_url
@@ -233,6 +241,18 @@ pub mod urls {
         );
         reqwest::Url::parse(&url).expect("failed to create run job url")
     }
+
+    pub fn dist_control_builder_info(dist_control_address: SocketAddr) -> reqwest::Url {
+        let url = format!(
+            "http://{}/api/v1/control/builder_info",
+            dist_control_address
+        );
+        reqwest::Url::parse(&url).unwrap()
+    }
+    pub fn dist_control_max_jobs(dist_control_address: SocketAddr) -> reqwest::Url {
+        let url = format!("http://{}/api/v1/control/max_jobs", dist_control_address);
+        reqwest::Url::parse(&url).unwrap()
+    }
 }
 
 #[cfg(feature = "dist-server")]
@@ -249,18 +269,18 @@ mod server {
     use std::net::SocketAddr;
     use std::result::Result as StdResult;
     use std::sync::atomic;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, Condvar, LazyLock, Mutex};
     use std::thread;
     use std::time::Duration;
 
     use super::common::{
         AllocJobHttpResponse, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
-        RunJobHttpRequest, ServerCertificateHttpResponse,
+        RunJobHttpRequest, ServerCertificateHttpResponse, SetMaxJobsLocalHttpRequest,
     };
     use super::urls;
     use crate::dist::{
-        self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAuthorizer,
-        JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
+        self, AllocJobResult, AssignJobResult, BuilderInfo, HeartbeatServerResult, InputsReader,
+        JobAuthorizer, JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
         SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
     };
     use crate::errors::*;
@@ -808,7 +828,7 @@ mod server {
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest { info, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
                         try_or_500_log!(req_id, maybe_update_certs(
                             &mut requester.client.lock().unwrap(),
                             &mut server_certificates.lock().unwrap(),
@@ -817,7 +837,7 @@ mod server {
                         let job_authorizer = JWTJobAuthorizer::new(jwt_key);
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
-                            num_cpus,
+                            info,
                             job_authorizer
                         ));
                         prepare_response(request, &res)
@@ -886,17 +906,31 @@ mod server {
         jwt_key: Vec<u8>,
         // Randomly generated nonce to allow the scheduler to detect server restarts
         server_nonce: ServerNonce,
+        name: String,
+        max_jobs: Arc<MaxJobs>,
+        dist_control_address: SocketAddr,
         handler: S,
     }
 
     impl<S: dist::ServerIncoming + 'static> Server<S> {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             public_addr: SocketAddr,
             bind_address: Option<SocketAddr>,
             scheduler_url: reqwest::Url,
             scheduler_auth: String,
+            name: String,
+            max_jobs: usize,
+            dist_control_address: SocketAddr,
             handler: S,
         ) -> Result<Self> {
+            // the dist control is used like a socket so it's only meant to be connected to locally
+            if !dist_control_address.ip().is_loopback() {
+                bail!(
+                    "dist_control_address {} is not a loopback address",
+                    dist_control_address
+                )
+            }
             let (cert_digest, cert_pem, privkey_pem) =
                 create_https_cert_and_privkey(public_addr)
                     .context("failed to create HTTPS certificate for server")?;
@@ -913,6 +947,9 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
+                name,
+                max_jobs: Arc::new(MaxJobs::new(max_jobs)),
+                dist_control_address,
                 handler,
             })
         }
@@ -927,11 +964,22 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
+                name,
+                max_jobs,
+                dist_control_address,
                 handler,
             } = self;
-            let heartbeat_req = HeartbeatServerHttpRequest {
-                num_cpus: num_cpus(),
+
+            let dist_control_address =
+                start_dist_control_listener(dist_control_address, name.clone(), max_jobs.clone())?;
+            info!(
+                "Server listening for control requests on {}",
+                dist_control_address
+            );
+
+            let mut heartbeat_request = HeartbeatServerHttpRequest {
                 jwt_key: jwt_key.clone(),
+                info: builder_info(&name, max_jobs.get()),
                 server_nonce,
                 cert_digest,
                 cert_pem: cert_pem.clone(),
@@ -950,12 +998,13 @@ mod server {
             // TODO: detect if this panics
             thread::spawn(move || {
                 loop {
+                    heartbeat_request.info.num_cpus = num_cpus();
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
-                    match bincode_req(
+                    let wait = match bincode_req(
                         heartbeat_client
                             .post(heartbeat_url.clone())
                             .bearer_auth(scheduler_auth.clone())
-                            .bincode(&heartbeat_req)
+                            .bincode(&heartbeat_request)
                             .expect("failed to serialize heartbeat"),
                     ) {
                         Ok(HeartbeatServerResult { is_new }) => {
@@ -964,13 +1013,15 @@ mod server {
                             if is_new {
                                 info!("Server connected to scheduler");
                             }
-                            thread::sleep(HEARTBEAT_INTERVAL)
+                            HEARTBEAT_INTERVAL
                         }
                         Err(e) => {
                             error!(target: "sccache_heartbeat", "Failed to send heartbeat to server: {}", e);
-                            thread::sleep(HEARTBEAT_ERROR_INTERVAL)
+                            HEARTBEAT_ERROR_INTERVAL
                         }
-                    }
+                    };
+                    heartbeat_request.info.max_jobs =
+                        max_jobs.wait_for_change(heartbeat_request.info.max_jobs, wait);
                 }
             });
 
@@ -1036,6 +1087,238 @@ mod server {
         }
     }
 
+    // mechanism to sleep the heartbeat-sending thread for brief periods but also allow waking it up
+    // whenever the user requests a change to the max jobs via the local dist_control endpoint
+    struct MaxJobs {
+        value: Mutex<usize>,
+        changed: Condvar,
+    }
+
+    impl MaxJobs {
+        fn new(value: usize) -> Self {
+            Self {
+                value: Mutex::new(value),
+                changed: Condvar::new(),
+            }
+        }
+        fn get(&self) -> usize {
+            *self.value.lock().unwrap()
+        }
+        fn set(&self, value: usize) {
+            *self.value.lock().unwrap() = value;
+            self.changed.notify_all();
+        }
+
+        // also wakes up if the user requested a change to the max jobs
+        fn wait_for_change(&self, sent: usize, timeout: Duration) -> usize {
+            let (value, _) = self
+                .changed
+                .wait_timeout_while(self.value.lock().unwrap(), timeout, |value| *value == sent)
+                .unwrap();
+            *value
+        }
+    }
+
+    fn builder_info(name: &str, max_jobs: usize) -> BuilderInfo {
+        BuilderInfo {
+            name: name.to_owned(),
+            num_cpus: num_cpus(),
+            max_jobs,
+        }
+    }
+
+    fn start_dist_control_listener(
+        dist_control_address: SocketAddr,
+        name: String,
+        max_jobs: Arc<MaxJobs>,
+    ) -> Result<SocketAddr> {
+        let request_count = atomic::AtomicUsize::new(0);
+        let server = rouille::Server::new(dist_control_address, move |request| {
+            let request_id = format!(
+                "control-{}",
+                request_count.fetch_add(1, atomic::Ordering::SeqCst)
+            );
+            control_response(&request_id, request, &name, &max_jobs)
+        })
+        .map_err(|error| {
+            anyhow!(
+                "Failed to start the dist control listener on {}: {}",
+                dist_control_address,
+                error
+            )
+        })?;
+        let bound_address = server.server_addr();
+        thread::spawn(move || server.run());
+        Ok(bound_address)
+    }
+
+    // handle API requests to the local dist_control endpoint
+    fn control_response(
+        request_id: &str,
+        request: &rouille::Request,
+        name: &str,
+        max_jobs: &MaxJobs,
+    ) -> rouille::Response {
+        trace!("Request {}: {:?}", request_id, request);
+        router!(request,
+            (GET) (/api/v1/control/builder_info) => {
+                rouille::Response::json(&builder_info(name, max_jobs.get()))
+            },
+            (PUT) (/api/v1/control/max_jobs) => {
+                let SetMaxJobsLocalHttpRequest { max_jobs: value } =
+                    try_or_400_log!(request_id, rouille::input::json_input(request));
+                max_jobs.set(value);
+                info!("max_jobs set to {} through the dist control listener", value);
+                rouille::Response::json(&builder_info(name, value))
+            },
+            _ => {
+                warn!("Unknown dist control request {:?}", request);
+                rouille::Response::empty_404()
+            },
+        )
+    }
+
+    #[test]
+    fn set_and_get_max_jobs() {
+        let max_jobs = MaxJobs::new(4);
+        let get = || {
+            let request =
+                rouille::Request::fake_http("GET", "/api/v1/control/builder_info", vec![], vec![]);
+            control_response("test", &request, "builder", &max_jobs)
+        };
+        let response_builder_info = |response: rouille::Response| -> BuilderInfo {
+            assert_eq!(response.status_code, 200);
+            let (mut body, _) = response.data.into_reader_and_size();
+            serde_json::from_reader(&mut body).unwrap()
+        };
+
+        assert_eq!(response_builder_info(get()), builder_info("builder", 4));
+
+        let request = rouille::Request::fake_http(
+            "PUT",
+            "/api/v1/control/max_jobs",
+            vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            br#"{"max_jobs": 0}"#.to_vec(),
+        );
+        let response = control_response("test", &request, "builder", &max_jobs);
+        assert_eq!(response_builder_info(response), builder_info("builder", 0));
+        assert_eq!(max_jobs.get(), 0);
+        assert_eq!(response_builder_info(get()), builder_info("builder", 0));
+
+        let request = rouille::Request::fake_http(
+            "PUT",
+            "/api/v1/control/max_jobs",
+            vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            br#"{"max_jobs": -1}"#.to_vec(),
+        );
+        let response = control_response("test", &request, "builder", &max_jobs);
+        assert_eq!(response.status_code, 400);
+        assert_eq!(max_jobs.get(), 0);
+    }
+
+    #[test]
+    fn changing_config_waking_up_heartbeat_thread() {
+        let max_jobs = Arc::new(MaxJobs::new(4));
+        let setter = {
+            let max_jobs = max_jobs.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                max_jobs.set(7);
+            })
+        };
+        let start = std::time::Instant::now();
+
+        // I guess in theory this could be a race if our thread gets unscheduled for an entire minute
+        assert_eq!(max_jobs.wait_for_change(4, Duration::from_secs(60)), 7);
+        assert!(start.elapsed() < Duration::from_secs(30));
+        setter.join().unwrap();
+
+        max_jobs.set(2);
+        assert_eq!(max_jobs.wait_for_change(7, Duration::from_secs(60)), 2);
+        assert_eq!(max_jobs.wait_for_change(2, Duration::from_millis(10)), 2);
+    }
+
+    #[cfg(test)]
+    struct UnusedServerIncoming;
+
+    #[cfg(test)]
+    impl dist::ServerIncoming for UnusedServerIncoming {
+        fn handle_assign_job(
+            &self,
+            _job_id: JobId,
+            _toolchain: Toolchain,
+        ) -> Result<AssignJobResult> {
+            unreachable!()
+        }
+        fn handle_submit_toolchain(
+            &self,
+            _requester: &dyn dist::ServerOutgoing,
+            _job_id: JobId,
+            _toolchain_reader: ToolchainReader<'_>,
+        ) -> Result<SubmitToolchainResult> {
+            unreachable!()
+        }
+        fn handle_run_job(
+            &self,
+            _requester: &dyn dist::ServerOutgoing,
+            _job_id: JobId,
+            _command: dist::CompileCommand,
+            _outputs: Vec<String>,
+            _inputs_reader: InputsReader<'_>,
+        ) -> Result<RunJobResult> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn only_local_addressses_allowed_for_dist_control() {
+        let result = Server::new(
+            "127.0.0.1:10501".parse().unwrap(),
+            None,
+            reqwest::Url::parse("https://127.0.0.1").unwrap(),
+            String::new(),
+            "builder".to_owned(),
+            1,
+            "0.0.0.0:10502".parse().unwrap(),
+            // no incoming messages given to server
+            UnusedServerIncoming,
+        );
+        let error = result.err().expect("expected IP to be rejected");
+        assert!(error.to_string().contains("not a loopback address"));
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn make_dist_controls_api_request() {
+        let max_jobs = Arc::new(MaxJobs::new(4));
+        let address = start_dist_control_listener(
+            "127.0.0.1:0".parse().unwrap(),
+            "builder".to_owned(),
+            max_jobs.clone(),
+        )
+        .unwrap();
+        assert_ne!(address.port(), 0);
+
+        assert_eq!(
+            super::client::request_dist_control(address, None).unwrap(),
+            builder_info("builder", 4)
+        );
+        assert_eq!(
+            super::client::request_dist_control(address, Some(0)).unwrap(),
+            builder_info("builder", 0)
+        );
+        assert_eq!(max_jobs.get(), 0);
+
+        let response = new_reqwest_blocking_client()
+            .put(urls::dist_control_max_jobs(address))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(r#"{"max_jobs": "many"}"#)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(max_jobs.get(), 0);
+    }
+
     struct ServerRequester {
         client: reqwest::blocking::Client,
         scheduler_url: reqwest::Url,
@@ -1092,6 +1375,29 @@ mod client {
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
+
+    // get info about the build server via the CLI, such as name, CPU, etc
+    // If set_max_jobs is specified then we set that in addition to getting
+    // the info
+    pub fn request_dist_control(
+        dist_control_address: std::net::SocketAddr,
+        set_max_jobs: Option<usize>,
+    ) -> Result<dist::BuilderInfo> {
+        let client = crate::util::new_reqwest_blocking_client();
+        let request = match set_max_jobs {
+            Some(max_jobs) => client
+                .put(urls::dist_control_max_jobs(dist_control_address))
+                .json(&super::common::SetMaxJobsLocalHttpRequest { max_jobs }),
+            None => client.get(urls::dist_control_builder_info(dist_control_address)),
+        };
+        request
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.json())
+            .with_context(|| {
+                format!("failed to reach the dist control listener at {dist_control_address}")
+            })
+    }
 
     pub struct Client {
         auth_token: String,

@@ -41,6 +41,10 @@ toolchains = []
 # the maximum size of the toolchain cache in bytes
 toolchain_cache_size = 5368709120
 cache_dir = "/home/user/.cache/sccache-dist-client"
+# address to listen on for control commands from the local host
+# (see Distributed.md, Changing max_jobs at runtime)
+# default value is 127.0.0.1:10502
+# dist_control_address = "127.0.0.1:10502"
 
 [dist.auth]
 type = "token"

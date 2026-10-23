@@ -100,6 +100,8 @@ sudo sccache-dist server --config server.conf
 
 As with the scheduler, if the build server fails to start you may need to set `SCCACHE_LOG=trace` to get useful diagnostics.
 
+It is possible to set a job limit for a server, see [the server configuration docs](Distributed.md#servertoml).
+
 Configure a client
 ------------------
 

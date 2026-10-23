@@ -190,6 +190,7 @@ pub fn sccache_client_cfg(
             toolchains: vec![],
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
+            dist_control_address: sccache::config::DEFAULT_DIST_CONTROL_ADDRESS,
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
@@ -213,6 +214,7 @@ fn sccache_server_cfg(
     tmpdir: &Path,
     scheduler_url: HTTPUrl,
     server_ip: IpAddr,
+    dist_control_address: SocketAddr,
 ) -> sccache::config::server::Config {
     let relpath = "server-cache";
     fs::create_dir(tmpdir.join(relpath)).unwrap();
@@ -230,7 +232,17 @@ fn sccache_server_cfg(
             token: DIST_SERVER_TOKEN.to_owned(),
         },
         toolchain_cache_size: TC_CACHE_SIZE,
+        name: None,
+        max_jobs: sccache::config::server::default_max_jobs(),
+        dist_control_address,
     }
+}
+
+// localhost + dynamically allocated port
+#[cfg(feature = "dist-server")]
+fn unused_local_address() -> SocketAddr {
+    let listener = net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    listener.local_addr().unwrap()
 }
 
 // TODO: this is copied from the sccache-dist binary - it's not clear where would be a better place to put the
@@ -243,8 +255,32 @@ fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
 #[cfg(feature = "dist-server")]
 #[allow(dead_code)]
 pub enum ServerHandle {
-    Container { cid: String, url: HTTPUrl },
-    Process { pid: Pid, url: HTTPUrl },
+    Container {
+        cid: String,
+        url: HTTPUrl,
+        dist_control_address: SocketAddr,
+    },
+    Process {
+        pid: Pid,
+        url: HTTPUrl,
+        dist_control_address: SocketAddr,
+    },
+}
+
+#[cfg(feature = "dist-server")]
+impl ServerHandle {
+    pub fn dist_control_address(&self) -> SocketAddr {
+        match self {
+            ServerHandle::Container {
+                dist_control_address,
+                ..
+            }
+            | ServerHandle::Process {
+                dist_control_address,
+                ..
+            } => *dist_control_address,
+        }
+    }
 }
 
 #[cfg(feature = "dist-server")]
@@ -426,7 +462,13 @@ impl DistSystem {
         check_output(&output);
 
         let server_ip = IpAddr::from_str("127.0.0.1").unwrap();
-        let server_cfg = sccache_server_cfg(&self.tmpdir, self.scheduler_url(), server_ip);
+        let dist_control_address = unused_local_address();
+        let server_cfg = sccache_server_cfg(
+            &self.tmpdir,
+            self.scheduler_url(),
+            server_ip,
+            dist_control_address,
+        );
         fs::File::create(&server_cfg_path)
             .unwrap()
             .write_all(&serde_json::to_vec(&server_cfg).unwrap())
@@ -439,6 +481,7 @@ impl DistSystem {
         let handle = ServerHandle::Container {
             cid: server_name,
             url,
+            dist_control_address,
         };
         self.wait_server_ready(&handle);
         handle
@@ -454,11 +497,15 @@ impl DistSystem {
             listener.local_addr().unwrap()
         };
         let token = create_server_token(ServerId::new(server_addr), DIST_SERVER_TOKEN);
+        let dist_control_address = unused_local_address();
         let server = dist::http::Server::new(
             server_addr,
             Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
             self.scheduler_url().to_url(),
             token,
+            "custom-server".to_owned(),
+            sccache::config::server::default_max_jobs(),
+            dist_control_address,
             handler,
         )
         .unwrap();
@@ -479,21 +526,25 @@ impl DistSystem {
 
         let url =
             HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{}", server_addr)).unwrap());
-        let handle = ServerHandle::Process { pid, url };
+        let handle = ServerHandle::Process {
+            pid,
+            url,
+            dist_control_address,
+        };
         self.wait_server_ready(&handle);
         handle
     }
 
     pub fn restart_server(&mut self, handle: &ServerHandle) {
         match handle {
-            ServerHandle::Container { cid, url: _ } => {
+            ServerHandle::Container { cid, .. } => {
                 let output = Command::new("docker")
                     .args(["restart", cid])
                     .output()
                     .unwrap();
                 check_output(&output);
             }
-            ServerHandle::Process { pid: _, url: _ } => {
+            ServerHandle::Process { .. } => {
                 // TODO: pretty easy, just no need yet
                 panic!("restart not yet implemented for pids")
             }
@@ -502,7 +553,7 @@ impl DistSystem {
     }
     pub fn count_toolchains_on_server(&mut self, handle: &ServerHandle) -> usize {
         match handle {
-            ServerHandle::Container { cid, url: _ } => {
+            ServerHandle::Container { cid, .. } => {
                 let output = Command::new("docker")
                     .args([
                         "exec",
@@ -519,7 +570,7 @@ impl DistSystem {
                 let str_output = String::from_utf8_lossy(&output.stdout);
                 str_output.lines().filter(|&part| !part.is_empty()).count()
             }
-            ServerHandle::Process { pid: _, url: _ } => {
+            ServerHandle::Process { .. } => {
                 panic!("restart not yet implemented for pids")
             }
         }
@@ -527,9 +578,7 @@ impl DistSystem {
 
     pub fn wait_server_ready(&mut self, handle: &ServerHandle) {
         let url = match handle {
-            ServerHandle::Container { cid: _, url } | ServerHandle::Process { pid: _, url } => {
-                url.clone()
-            }
+            ServerHandle::Container { url, .. } | ServerHandle::Process { url, .. } => url.clone(),
         };
         wait_for_http(url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(

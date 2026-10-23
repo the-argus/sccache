@@ -8,11 +8,11 @@ use sccache::config::{
     INSECURE_DIST_CLIENT_TOKEN, scheduler as scheduler_config, server as server_config,
 };
 use sccache::dist::{
-    self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
-    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, RunJobResult,
-    SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming,
-    ServerNonce, ServerOutgoing, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
-    UpdateJobStateResult,
+    self, AllocJobResult, AssignJobResult, BuilderIncoming, BuilderInfo, CompileCommand,
+    HeartbeatServerResult, InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState,
+    RunJobResult, SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId,
+    ServerIncoming, ServerNonce, ServerOutgoing, SubmitToolchainResult, TcCache, Toolchain,
+    ToolchainReader, UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
@@ -232,15 +232,27 @@ fn run(command: Command) -> Result<i32> {
             unreachable!();
         }
 
-        Command::Server(server_config::Config {
-            builder,
-            cache_dir,
-            public_addr,
-            bind_address,
-            scheduler_url,
-            scheduler_auth,
-            toolchain_cache_size,
-        }) => {
+        Command::Server(config) => {
+            let server_config::Config {
+                builder,
+                cache_dir,
+                public_addr,
+                bind_address,
+                scheduler_url,
+                scheduler_auth,
+                toolchain_cache_size,
+                name,
+                max_jobs,
+                dist_control_address,
+            } = *config;
+            let name = match name {
+                Some(name) => name,
+                None => hostname::get()
+                    .context("Failed to get the hostname to use as the server name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+
             let builder: Box<dyn dist::BuilderIncoming> = match builder {
                 #[cfg(not(target_os = "freebsd"))]
                 server_config::BuilderType::Docker => {
@@ -304,6 +316,9 @@ fn run(command: Command) -> Result<i32> {
                 bind_address,
                 scheduler_url.to_url(),
                 scheduler_auth,
+                name,
+                max_jobs,
+                dist_control_address,
                 server,
             )
             .context("Failed to create sccache HTTP server instance")?;
@@ -329,8 +344,6 @@ fn init_logging() {
     }
 }
 
-// Maximum number of jobs per core - only occurs for one core, usually less, see load_weight()
-const MAX_PER_CORE_LOAD: f64 = 2f64;
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -363,7 +376,7 @@ struct ServerDetails {
     jobs_unclaimed: HashMap<JobId, Instant>,
     last_seen: Instant,
     last_error: Option<Instant>,
-    num_cpus: usize,
+    info: BuilderInfo,
     server_nonce: ServerNonce,
     job_authorizer: Box<dyn JobAuthorizer>,
 }
@@ -434,18 +447,12 @@ impl Default for Scheduler {
     }
 }
 
-fn load_weight(job_count: usize, core_count: usize) -> f64 {
-    // Oversubscribe cores just a little to make up for network and I/O latency. This formula is
-    // not based on hard data but an extrapolation to high core counts of the conventional wisdom
-    // that slightly more jobs than cores achieve the shortest compile time. Which is originally
-    // about local compiles and this is over the network, so be slightly less conservative.
-    let cores_plus_slack = core_count + 1 + core_count / 8;
-    // Note >=, not >, because the question is "can we add another job"?
-    if job_count >= cores_plus_slack {
-        MAX_PER_CORE_LOAD + 1f64 // no new jobs for now
-    } else {
-        job_count as f64 / core_count as f64
-    }
+fn servers_named(servers: &HashMap<ServerId, ServerDetails>, name: &str) -> Vec<ServerId> {
+    servers
+        .iter()
+        .filter(|(_, details)| details.info.name == name)
+        .map(|(&server_id, _)| server_id)
+        .collect()
 }
 
 impl SchedulerIncoming for Scheduler {
@@ -459,57 +466,45 @@ impl SchedulerIncoming for Scheduler {
             let mut servers = self.servers.lock().unwrap();
 
             let res = {
-                let mut best = None;
-                let mut best_err = None;
-                let mut best_load: f64 = MAX_PER_CORE_LOAD;
                 let now = Instant::now();
+                let mut best: Option<(ServerId, f64)> = None;
+                let mut best_err: Option<(ServerId, Instant)> = None;
                 for (&server_id, details) in servers.iter_mut() {
-                    let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
+                    let num_jobs_assigned = details.jobs_assigned.len();
+                    let max_jobs = details.info.max_jobs;
+                    if num_jobs_assigned >= max_jobs {
+                        continue;
+                    }
 
                     if let Some(last_error) = details.last_error {
-                        if load < MAX_PER_CORE_LOAD {
-                            if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
-                                details.last_error = None;
-                            }
-                            match best_err {
-                                Some((
-                                    _,
-                                    &mut ServerDetails {
-                                        last_error: Some(best_last_err),
-                                        ..
-                                    },
-                                )) => {
-                                    if last_error < best_last_err {
-                                        trace!(
-                                            "Selected {:?}, its most recent error is {:?} ago",
-                                            server_id,
-                                            now - last_error
-                                        );
-                                        best_err = Some((server_id, details));
-                                    }
-                                }
-                                _ => {
-                                    trace!(
-                                        "Selected {:?}, its most recent error is {:?} ago",
-                                        server_id,
-                                        now - last_error
-                                    );
-                                    best_err = Some((server_id, details));
-                                }
-                            }
+                        if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
+                            details.last_error = None;
                         }
-                    } else if load < best_load {
-                        best = Some((server_id, details));
-                        trace!("Selected {:?} as the server with the best load", server_id);
-                        best_load = load;
-                        if load == 0f64 {
-                            break;
+                        if best_err.is_none_or(|(_, best_last_err)| last_error < best_last_err) {
+                            trace!(
+                                "Selected {:?}, its most recent error is {:?} ago",
+                                server_id,
+                                now - last_error
+                            );
+                            best_err = Some((server_id, last_error));
+                        }
+                    } else {
+                        let load = num_jobs_assigned as f64 / max_jobs as f64;
+                        if best.is_none_or(|(_, best_load)| load < best_load) {
+                            trace!("Selected {:?} as the server with the best load", server_id);
+                            best = Some((server_id, load));
                         }
                     }
                 }
 
                 // Assign the job to our best choice
-                if let Some((server_id, server_details)) = best.or(best_err) {
+                if let Some(server_id) = best
+                    .map(|(server_id, _)| server_id)
+                    .or(best_err.map(|(server_id, _)| server_id))
+                {
+                    let server_details = servers
+                        .get_mut(&server_id)
+                        .expect("selected server not found in map");
                     let job_id = self.next_job_id();
                     assert!(server_details.jobs_assigned.insert(job_id));
                     assert!(
@@ -604,11 +599,14 @@ impl SchedulerIncoming for Scheduler {
         &self,
         server_id: ServerId,
         server_nonce: ServerNonce,
-        num_cpus: usize,
+        info: BuilderInfo,
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
-        if num_cpus == 0 {
+        if info.num_cpus == 0 {
             bail!("Invalid number of CPUs (0) specified in heartbeat")
+        }
+        if info.name.is_empty() {
+            bail!("Empty server name specified in heartbeat")
         }
 
         // LOCKS
@@ -621,6 +619,7 @@ impl SchedulerIncoming for Scheduler {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
+                details.info = info;
 
                 let mut stale_jobs = Vec::new();
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
@@ -693,7 +692,11 @@ impl SchedulerIncoming for Scheduler {
             }
             _ => (),
         }
-        info!("Registered new server {:?}", server_id);
+        info!(
+            "Registered new server {:?} named {:?}",
+            server_id, info.name
+        );
+        let name = info.name.clone();
         servers.insert(
             server_id,
             ServerDetails {
@@ -701,11 +704,18 @@ impl SchedulerIncoming for Scheduler {
                 last_error: None,
                 jobs_assigned: HashSet::new(),
                 jobs_unclaimed: HashMap::new(),
-                num_cpus,
+                info,
                 server_nonce,
                 job_authorizer,
             },
         );
+        let same_name = servers_named(&servers, &name);
+        if same_name.len() > 1 {
+            error!(
+                "Servers {:?} are registered with the same name {:?}",
+                same_name, name
+            );
+        }
         Ok(HeartbeatServerResult { is_new: true })
     }
 
@@ -771,7 +781,7 @@ impl SchedulerIncoming for Scheduler {
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
-            num_cpus: servers.values().map(|v| v.num_cpus).sum(),
+            num_cpus: servers.values().map(|v| v.info.num_cpus).sum(),
             in_progress: jobs.len(),
         })
     }
@@ -912,6 +922,503 @@ mod scheduler_tests {
         }
     }
 
+    fn builder_info(name: &str, num_cpus: usize, max_jobs: usize) -> BuilderInfo {
+        BuilderInfo {
+            name: name.to_owned(),
+            num_cpus,
+            max_jobs,
+        }
+    }
+
+    // just for shorthand
+    fn heartbeat(
+        scheduler: &Scheduler,
+        server_id: ServerId,
+        server_nonce: &ServerNonce,
+        info: BuilderInfo,
+    ) -> Result<HeartbeatServerResult> {
+        scheduler.handle_heartbeat_server(
+            server_id,
+            server_nonce.clone(),
+            info,
+            Box::new(TestJobAuthorizer),
+        )
+    }
+
+    fn get_builder_info_for_server(scheduler: &Scheduler, server_id: ServerId) -> BuilderInfo {
+        let servers = scheduler.servers.lock().unwrap();
+        servers.get(&server_id).unwrap().info.clone()
+    }
+
+    struct DummyAlwaysAcceptStrategy;
+
+    impl SchedulerOutgoing for DummyAlwaysAcceptStrategy {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _toolchain: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    // returns server that was given the job
+    fn allocate(scheduler: &Scheduler) -> Option<ServerId> {
+        let toolchain = Toolchain {
+            archive_id: "some_toolchain".to_owned(),
+        };
+        match scheduler
+            .handle_alloc_job(&DummyAlwaysAcceptStrategy, toolchain)
+            .unwrap()
+        {
+            AllocJobResult::Success { job_alloc, .. } => Some(job_alloc.server_id),
+            AllocJobResult::Fail { .. } => None,
+        }
+    }
+
+    #[test]
+    fn heartbeat_updates_info_of_known_server() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_nonce = ServerNonce::new();
+
+        let result = heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 5),
+        )
+        .unwrap();
+        assert!(result.is_new);
+        assert_eq!(
+            get_builder_info_for_server(&scheduler, server_id),
+            builder_info("a", 4, 5)
+        );
+
+        let result = heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 8, 2),
+        )
+        .unwrap();
+        assert!(!result.is_new);
+        assert_eq!(
+            get_builder_info_for_server(&scheduler, server_id),
+            builder_info("a", 8, 2)
+        );
+        assert_eq!(scheduler.handle_status().unwrap().num_cpus, 8);
+    }
+
+    #[test]
+    fn zero_max_jobs_effectively_disables_a_server() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &ServerNonce::new(),
+            builder_info("a", 4, 0),
+        )
+        .unwrap();
+
+        assert_eq!(allocate(&scheduler), None);
+    }
+
+    #[test]
+    fn increasing_max_jobs_while_running() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_nonce = ServerNonce::new();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 2),
+        )
+        .unwrap();
+
+        assert_eq!(allocate(&scheduler), Some(server_id));
+        assert_eq!(allocate(&scheduler), Some(server_id));
+        assert_eq!(allocate(&scheduler), None); // reached max jobs
+
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 3),
+        )
+        .unwrap();
+        // one more job is now allowed so one more allocation works
+        assert_eq!(allocate(&scheduler), Some(server_id));
+        assert_eq!(allocate(&scheduler), None); // max again
+
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 1),
+        )
+        .unwrap();
+        assert_eq!(allocate(&scheduler), None);
+        assert_eq!(scheduler.jobs.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn basic_load_balancing() {
+        let scheduler = Scheduler::new();
+        let small: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let large: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            small,
+            &ServerNonce::new(),
+            builder_info("small", 2, 2),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            large,
+            &ServerNonce::new(),
+            builder_info("large", 8, 8),
+        )
+        .unwrap();
+
+        let mut selected_server_ids = Vec::new();
+        let count_jobs_on_server = |selected_server_ids: &[ServerId], server_id| {
+            selected_server_ids
+                .iter()
+                .filter(|&&id| id == server_id)
+                .count()
+        };
+
+        // okay, if five jobs are pushed, and we are balancing load, then
+        // the 8 job machine should have 4, and the 2 job machine should have 1
+        for _ in 0..5 {
+            selected_server_ids.push(allocate(&scheduler).unwrap());
+        }
+        assert_eq!(count_jobs_on_server(&selected_server_ids, small), 1);
+        assert_eq!(count_jobs_on_server(&selected_server_ids, large), 4);
+
+        // now just test that things properly fill up without error
+        for _ in 0..5 {
+            selected_server_ids.push(allocate(&scheduler).unwrap());
+        }
+        assert_eq!(count_jobs_on_server(&selected_server_ids, small), 2);
+        assert_eq!(count_jobs_on_server(&selected_server_ids, large), 8);
+        assert_eq!(allocate(&scheduler), None); // max reached
+    }
+
+    #[test]
+    fn restarting_a_server_clears_anything_having_to_do_with_previous_run() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &ServerNonce::new(),
+            builder_info("a", 4, 4),
+        )
+        .unwrap();
+        assert_eq!(allocate(&scheduler), Some(server_id));
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            assert_eq!(servers.get(&server_id).unwrap().jobs_assigned.len(), 1);
+        }
+
+        let result = heartbeat(
+            &scheduler,
+            server_id,
+            &ServerNonce::new(),
+            builder_info("a", 4, 4),
+        )
+        .unwrap();
+        assert!(result.is_new);
+
+        // running jobs are cleared
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
+
+        // assigned jobs also cleared
+        let servers = scheduler.servers.lock().unwrap();
+        assert!(servers.get(&server_id).unwrap().jobs_assigned.is_empty());
+    }
+
+    #[test]
+    fn duplicate_names_still_work() {
+        let scheduler = Scheduler::new();
+        let first: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let second: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let third: ServerId = "127.0.0.3:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            first,
+            &ServerNonce::new(),
+            builder_info("dup", 4, 4),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            second,
+            &ServerNonce::new(),
+            builder_info("dup", 4, 4),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            third,
+            &ServerNonce::new(),
+            builder_info("other", 4, 4),
+        )
+        .unwrap();
+
+        // make sure that each of the servers still gets registered with us, seems fine
+        let servers = scheduler.servers.lock().unwrap();
+        let mut duplicates = servers_named(&servers, "dup");
+        duplicates.sort_by_key(|server_id| server_id.addr());
+        assert_eq!(duplicates, vec![first, second]);
+        assert_eq!(servers_named(&servers, "other"), vec![third]);
+    }
+
+    fn time_ago(duration: Duration) -> Instant {
+        Instant::now().checked_sub(duration).unwrap()
+    }
+
+    #[test]
+    fn invalid_heartbeat() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_nonce = ServerNonce::new();
+
+        assert!(
+            heartbeat(
+                &scheduler,
+                server_id,
+                &server_nonce,
+                builder_info("a", 0, 1)
+            )
+            .is_err()
+        );
+        assert!(heartbeat(&scheduler, server_id, &server_nonce, builder_info("", 4, 1)).is_err());
+        assert!(scheduler.servers.lock().unwrap().is_empty());
+    }
+
+    fn set_last_error(scheduler: &Scheduler, server_id: ServerId, last_error: Instant) {
+        let mut servers = scheduler.servers.lock().unwrap();
+        servers.get_mut(&server_id).unwrap().last_error = Some(last_error);
+    }
+
+    #[test]
+    fn servers_with_error_can_be_picked_if_all_others_are_full() {
+        let scheduler = Scheduler::new();
+        let healthy: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let errored: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            healthy,
+            &ServerNonce::new(),
+            builder_info("healthy", 4, 2),
+        )
+        .unwrap();
+
+        heartbeat(
+            &scheduler,
+            errored,
+            &ServerNonce::new(),
+            builder_info("errored", 4, 8),
+        )
+        .unwrap();
+        set_last_error(&scheduler, errored, time_ago(Duration::from_secs(1)));
+
+        assert_eq!(allocate(&scheduler), Some(healthy));
+        assert_eq!(allocate(&scheduler), Some(healthy));
+        for _ in 0..8 {
+            assert_eq!(allocate(&scheduler), Some(errored));
+        }
+        assert_eq!(allocate(&scheduler), None);
+    }
+
+    #[test]
+    fn of_multiple_servers_with_errors_the_oldest_errored_one_is_higher_priority() {
+        let scheduler = Scheduler::new();
+        let older_error: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let newer_error: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            older_error,
+            &ServerNonce::new(),
+            builder_info("full", 4, 2),
+        )
+        .unwrap();
+        set_last_error(&scheduler, older_error, time_ago(Duration::from_secs(10)));
+
+        heartbeat(
+            &scheduler,
+            newer_error,
+            &ServerNonce::new(),
+            builder_info("errored", 4, 8),
+        )
+        .unwrap();
+        set_last_error(&scheduler, newer_error, time_ago(Duration::from_secs(1)));
+
+        // older error picked first even though it has more load
+        assert_eq!(allocate(&scheduler), Some(older_error));
+        assert_eq!(allocate(&scheduler), Some(older_error));
+
+        for _ in 0..8 {
+            assert_eq!(allocate(&scheduler), Some(newer_error));
+        }
+        assert_eq!(allocate(&scheduler), None);
+    }
+
+    #[test]
+    fn old_pending_jobs_timeout() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_nonce = ServerNonce::new();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 1),
+        )
+        .unwrap();
+        assert_eq!(allocate(&scheduler), Some(server_id));
+        assert_eq!(allocate(&scheduler), None); // max capacity
+
+        // force the pending job to be timed out
+        for pending_job_last_seen_time in scheduler
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut(&server_id)
+            .unwrap()
+            .jobs_unclaimed
+            .values_mut()
+        {
+            *pending_job_last_seen_time =
+                time_ago(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1));
+        }
+
+        // if the server didn't pick up the job, then it is considered failed and space is open
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 1),
+        )
+        .unwrap();
+        assert_eq!(allocate(&scheduler), Some(server_id));
+    }
+
+    struct ServerThatSendsHeartbeatDuringJobAllocation<'a> {
+        scheduler: &'a Scheduler,
+        server_nonce: ServerNonce,
+        info: BuilderInfo,
+    }
+
+    impl SchedulerOutgoing for ServerThatSendsHeartbeatDuringJobAllocation<'_> {
+        fn do_assign_job(
+            &self,
+            server_id: ServerId,
+            _job_id: JobId,
+            _toolchain: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            heartbeat(
+                self.scheduler,
+                server_id,
+                &self.server_nonce,
+                self.info.clone(),
+            )?;
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    // try to test some potential weird interleaving of messages
+    #[test]
+    fn max_jobs_lowered_during_job_allocation() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_nonce = ServerNonce::new();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 4, 1),
+        )
+        .unwrap();
+
+        let requester = ServerThatSendsHeartbeatDuringJobAllocation {
+            scheduler: &scheduler,
+            server_nonce,
+            info: builder_info("a", 4, 0),
+        };
+        let allocation = scheduler
+            .handle_alloc_job(
+                &requester,
+                Toolchain {
+                    archive_id: "some_toolchain".to_owned(),
+                },
+            )
+            .unwrap();
+        // seems fine
+        assert!(matches!(allocation, AllocJobResult::Success { .. }));
+
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(&server_id).unwrap();
+        assert_eq!(details.info.max_jobs, 0);
+        assert_eq!(details.jobs_assigned.len(), 1);
+    }
+
+    // this one should not work
+    #[test]
+    fn server_restart_during_job_allocation() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &ServerNonce::new(),
+            builder_info("a", 4, 1),
+        )
+        .unwrap();
+
+        let requester = ServerThatSendsHeartbeatDuringJobAllocation {
+            scheduler: &scheduler,
+            // show the server as having restarted with a new nonce
+            server_nonce: ServerNonce::new(),
+            info: builder_info("a", 4, 1),
+        };
+        let allocation = scheduler
+            .handle_alloc_job(
+                &requester,
+                Toolchain {
+                    archive_id: "some_toolchain".to_owned(),
+                },
+            )
+            .unwrap();
+
+        // this should not work
+        match allocation {
+            AllocJobResult::Fail { msg: message } => {
+                assert!(
+                    message.contains("cleaned up before allocation completed"),
+                    "{message}"
+                );
+            }
+            AllocJobResult::Success { .. } => panic!("expected job allocation to fail"),
+        }
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
+    }
+
     struct ReapDuringAssign<'a> {
         scheduler: &'a Scheduler,
         server_id: ServerId,
@@ -936,11 +1443,11 @@ mod scheduler_tests {
                     .unwrap();
             }
 
-            let heartbeat = self.scheduler.handle_heartbeat_server(
+            let heartbeat = heartbeat(
+                self.scheduler,
                 server_id,
-                self.server_nonce.clone(),
-                1,
-                Box::new(TestJobAuthorizer),
+                &self.server_nonce,
+                builder_info("a", 1, 2),
             )?;
             assert!(!heartbeat.is_new);
 
@@ -957,14 +1464,13 @@ mod scheduler_tests {
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
 
-        scheduler
-            .handle_heartbeat_server(
-                server_id,
-                server_nonce.clone(),
-                1,
-                Box::new(TestJobAuthorizer),
-            )
-            .unwrap();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &server_nonce,
+            builder_info("a", 1, 2),
+        )
+        .unwrap();
 
         let requester = ReapDuringAssign {
             scheduler: &scheduler,
@@ -975,7 +1481,7 @@ mod scheduler_tests {
             .handle_alloc_job(
                 &requester,
                 Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
+                    archive_id: "some_toolchain".to_owned(),
                 },
             )
             .unwrap();
