@@ -15,7 +15,7 @@
 pub use self::client::{Client, request_dist_control};
 pub use self::common::{SetMaxJobsLocalHttpRequest, SetMaxMemoryLocalHttpRequest};
 #[cfg(feature = "dist-server")]
-pub use self::server::Server;
+pub use self::server::{BuilderIdentity, Server};
 #[cfg(feature = "dist-server")]
 pub use self::server::{
     ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
@@ -985,7 +985,7 @@ mod server {
         jwt_key: Vec<u8>,
         // Randomly generated nonce to allow the scheduler to detect server restarts
         server_nonce: ServerNonce,
-        name: String,
+        identity: Arc<BuilderIdentity>,
         limits: Arc<LiveLimits>,
         dist_control_address: SocketAddr,
         handler: S,
@@ -998,7 +998,7 @@ mod server {
             bind_address: Option<SocketAddr>,
             scheduler_url: reqwest::Url,
             scheduler_auth: String,
-            name: String,
+            identity: BuilderIdentity,
             max_jobs: usize,
             max_memory: Option<u64>,
             dist_control_address: SocketAddr,
@@ -1027,7 +1027,7 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
-                name,
+                identity: Arc::new(identity),
                 limits: Arc::new(LiveLimits::new(BuilderLimits {
                     max_jobs,
                     max_memory,
@@ -1047,26 +1047,24 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
-                name,
+                identity,
                 limits,
                 dist_control_address,
                 handler,
             } = self;
 
-            let dist_control_address =
-                start_dist_control_listener(dist_control_address, name.clone(), limits.clone())?;
+            let dist_control_address = start_dist_control_listener(
+                dist_control_address,
+                identity.clone(),
+                limits.clone(),
+            )?;
             info!(
                 "Server listening for control requests on {}",
                 dist_control_address
             );
 
-            let mut heartbeat_request = HeartbeatServerHttpRequest {
-                jwt_key: jwt_key.clone(),
-                info: builder_info(&name, limits.get()),
-                server_nonce,
-                cert_digest,
-                cert_pem: cert_pem.clone(),
-            };
+            let heartbeat_jwt_key = jwt_key.clone();
+            let heartbeat_cert_pem = cert_pem.clone();
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
             let requester = ServerRequester {
@@ -1081,7 +1079,13 @@ mod server {
             // TODO: detect if this panics
             thread::spawn(move || {
                 loop {
-                    heartbeat_request.info = builder_info(&name, limits.get());
+                    let heartbeat_request = HeartbeatServerHttpRequest {
+                        jwt_key: heartbeat_jwt_key.clone(),
+                        info: builder_info(&identity, cpu_model(), limits.get()),
+                        server_nonce: server_nonce.clone(),
+                        cert_digest: cert_digest.clone(),
+                        cert_pem: heartbeat_cert_pem.clone(),
+                    };
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
                     let wait = match bincode_req(
                         heartbeat_client
@@ -1204,17 +1208,42 @@ mod server {
         }
     }
 
-    fn builder_info(name: &str, limits: BuilderLimits) -> BuilderInfo {
+    // fields of a dist builder that don't change while it is running
+    pub struct BuilderIdentity {
+        pub name: String,
+        pub configured_cpu_speed: Option<u32>,
+    }
+
+    fn builder_info(
+        identity: &BuilderIdentity,
+        cpu_model: Option<String>,
+        limits: BuilderLimits,
+    ) -> BuilderInfo {
         BuilderInfo {
-            name: name.to_owned(),
+            name: identity.name.clone(),
             num_cpus: num_cpus(),
+            cpu_model,
+            configured_cpu_speed: identity.configured_cpu_speed,
             limits,
         }
     }
 
+    fn cpu_model() -> Option<String> {
+        parse_cpu_model(&std::fs::read_to_string("/proc/cpuinfo").ok()?)
+    }
+
+    // note that this does not work on ARM systems
+    fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
+        cpuinfo.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let value = value.trim();
+            (key.trim() == "model name" && !value.is_empty()).then(|| value.to_owned())
+        })
+    }
+
     fn start_dist_control_listener(
         dist_control_address: SocketAddr,
-        name: String,
+        identity: Arc<BuilderIdentity>,
         limits: Arc<LiveLimits>,
     ) -> Result<SocketAddr> {
         let request_count = atomic::AtomicUsize::new(0);
@@ -1223,7 +1252,7 @@ mod server {
                 "control-{}",
                 request_count.fetch_add(1, atomic::Ordering::SeqCst)
             );
-            control_response(&request_id, request, &name, &limits)
+            control_response(&request_id, request, &identity, cpu_model(), &limits)
         })
         .map_err(|error| {
             anyhow!(
@@ -1241,20 +1270,21 @@ mod server {
     fn control_response(
         request_id: &str,
         request: &rouille::Request,
-        name: &str,
+        identity: &BuilderIdentity,
+        cpu_model: Option<String>,
         limits: &LiveLimits,
     ) -> rouille::Response {
         trace!("Request {}: {:?}", request_id, request);
         router!(request,
             (GET) (/api/v1/control/builder_info) => {
-                rouille::Response::json(&builder_info(name, limits.get()))
+                rouille::Response::json(&builder_info(identity, cpu_model.clone(), limits.get()))
             },
             (PUT) (/api/v1/control/max_jobs) => {
                 let SetMaxJobsLocalHttpRequest { max_jobs } =
                     try_or_400_log!(request_id, rouille::input::json_input(request));
                 let new_limits = limits.update(|limits| limits.max_jobs = max_jobs);
                 info!("max_jobs set to {} through the dist control listener", max_jobs);
-                rouille::Response::json(&builder_info(name, new_limits))
+                rouille::Response::json(&builder_info(identity, cpu_model.clone(), new_limits))
             },
             (PUT) (/api/v1/control/max_memory) => {
                 let SetMaxMemoryLocalHttpRequest { max_memory } =
@@ -1264,13 +1294,26 @@ mod server {
                     Some(max_memory) => info!("max_memory set to {} bytes through the dist control listener", max_memory),
                     None => info!("max_memory turned off through the dist control listener"),
                 }
-                rouille::Response::json(&builder_info(name, new_limits))
+                rouille::Response::json(&builder_info(identity, cpu_model.clone(), new_limits))
             },
             _ => {
                 warn!("Unknown dist control request {:?}", request);
                 rouille::Response::empty_404()
             },
         )
+    }
+
+    #[cfg(test)]
+    fn test_identity(configured_cpu_speed: Option<u32>) -> BuilderIdentity {
+        BuilderIdentity {
+            name: "builder".to_owned(),
+            configured_cpu_speed,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_cpu_model() -> Option<String> {
+        Some("Test CPU @ 1.00GHz".to_owned())
     }
 
     #[cfg(test)]
@@ -1304,28 +1347,48 @@ mod server {
         let get = || {
             let request =
                 rouille::Request::fake_http("GET", "/api/v1/control/builder_info", vec![], vec![]);
-            control_response("test", &request, "builder", &live_limits)
+            control_response(
+                "test",
+                &request,
+                &test_identity(None),
+                test_cpu_model(),
+                &live_limits,
+            )
         };
 
+        let info = response_builder_info(get());
+        assert_eq!(info.cpu_model.as_deref(), Some("Test CPU @ 1.00GHz"));
         assert_eq!(
-            response_builder_info(get()),
-            builder_info("builder", limits(4, None))
+            info,
+            builder_info(&test_identity(None), test_cpu_model(), limits(4, None))
         );
 
         let request = put_json("/api/v1/control/max_jobs", r#"{"max_jobs": 0}"#);
-        let response = control_response("test", &request, "builder", &live_limits);
+        let response = control_response(
+            "test",
+            &request,
+            &test_identity(None),
+            test_cpu_model(),
+            &live_limits,
+        );
         assert_eq!(
             response_builder_info(response),
-            builder_info("builder", limits(0, None))
+            builder_info(&test_identity(None), test_cpu_model(), limits(0, None))
         );
         assert_eq!(live_limits.get(), limits(0, None));
         assert_eq!(
             response_builder_info(get()),
-            builder_info("builder", limits(0, None))
+            builder_info(&test_identity(None), test_cpu_model(), limits(0, None))
         );
 
         let request = put_json("/api/v1/control/max_jobs", r#"{"max_jobs": -1}"#);
-        let response = control_response("test", &request, "builder", &live_limits);
+        let response = control_response(
+            "test",
+            &request,
+            &test_identity(None),
+            test_cpu_model(),
+            &live_limits,
+        );
         assert_eq!(response.status_code, 400);
         assert_eq!(live_limits.get(), limits(0, None));
     }
@@ -1338,25 +1401,47 @@ mod server {
             "/api/v1/control/max_memory",
             r#"{"max_memory": 1073741824}"#,
         );
-        let response = control_response("test", &request, "builder", &live_limits);
+        let response = control_response(
+            "test",
+            &request,
+            &test_identity(None),
+            test_cpu_model(),
+            &live_limits,
+        );
         assert_eq!(
             response_builder_info(response),
-            builder_info("builder", limits(4, Some(1 << 30)))
+            builder_info(
+                &test_identity(None),
+                test_cpu_model(),
+                limits(4, Some(1 << 30))
+            )
         );
         assert_eq!(live_limits.get(), limits(4, Some(1 << 30)));
 
         for body in [r#"{"max_memory": -1}"#, r#"{"max_memory": "1G"}"#, r#"{}"#] {
             let request = put_json("/api/v1/control/max_memory", body);
-            let response = control_response("test", &request, "builder", &live_limits);
+            let response = control_response(
+                "test",
+                &request,
+                &test_identity(None),
+                test_cpu_model(),
+                &live_limits,
+            );
             assert_eq!(response.status_code, 400, "{body}");
         }
         assert_eq!(live_limits.get(), limits(4, Some(1 << 30)));
 
         let request = put_json("/api/v1/control/max_memory", r#"{"max_memory": null}"#);
-        let response = control_response("test", &request, "builder", &live_limits);
+        let response = control_response(
+            "test",
+            &request,
+            &test_identity(None),
+            test_cpu_model(),
+            &live_limits,
+        );
         assert_eq!(
             response_builder_info(response),
-            builder_info("builder", limits(4, None))
+            builder_info(&test_identity(None), test_cpu_model(), limits(4, None))
         );
         assert_eq!(live_limits.get(), limits(4, None));
     }
@@ -1377,6 +1462,40 @@ mod server {
         live_limits.update(|limits| limits.max_memory = Some(1 << 30));
         live_limits.wait_for_change(limits(7, None), Duration::MAX);
         assert_eq!(live_limits.get(), limits(7, Some(1 << 30)));
+    }
+
+    #[test]
+    fn test_parse_cpu_model() {
+        const X86_64: &str = "\
+processor\t: 0
+vendor_id\t: AuthenticAMD
+cpu family\t: 25
+model\t\t: 33
+model name\t: AMD Ryzen 9 5950X 16-Core Processor\x20\x20\x20
+stepping\t: 0
+
+processor\t: 1
+vendor_id\t: AuthenticAMD
+model name\t: Some Other Processor
+";
+        assert_eq!(
+            parse_cpu_model(X86_64).as_deref(),
+            Some("AMD Ryzen 9 5950X 16-Core Processor")
+        );
+
+        const ARM64: &str = "\
+processor\t: 0
+BogoMIPS\t: 50.00
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics
+CPU implementer\t: 0x41
+CPU architecture: 8
+CPU variant\t: 0x3
+CPU part\t: 0xd0c
+CPU revision\t: 1
+";
+        assert_eq!(parse_cpu_model(ARM64), None);
+        assert_eq!(parse_cpu_model("model name\t: \n"), None);
+        assert_eq!(parse_cpu_model(""), None);
     }
 
     #[cfg(test)]
@@ -1418,7 +1537,7 @@ mod server {
             None,
             reqwest::Url::parse("https://127.0.0.1").unwrap(),
             String::new(),
-            "builder".to_owned(),
+            test_identity(None),
             1,
             None,
             "0.0.0.0:10502".parse().unwrap(),
@@ -1435,7 +1554,7 @@ mod server {
         let live_limits = Arc::new(LiveLimits::new(limits(4, None)));
         let address = start_dist_control_listener(
             "127.0.0.1:0".parse().unwrap(),
-            "builder".to_owned(),
+            Arc::new(test_identity(Some(1500))),
             live_limits.clone(),
         )
         .unwrap();
@@ -1443,24 +1562,32 @@ mod server {
 
         assert_eq!(
             super::client::request_dist_control(address, None, None).unwrap(),
-            builder_info("builder", limits(4, None))
+            builder_info(&test_identity(Some(1500)), cpu_model(), limits(4, None))
         );
         assert_eq!(
             super::client::request_dist_control(address, Some(0), None).unwrap(),
-            builder_info("builder", limits(0, None))
+            builder_info(&test_identity(Some(1500)), cpu_model(), limits(0, None))
         );
         assert_eq!(
             super::client::request_dist_control(address, None, Some(Some(1 << 30))).unwrap(),
-            builder_info("builder", limits(0, Some(1 << 30)))
+            builder_info(
+                &test_identity(Some(1500)),
+                cpu_model(),
+                limits(0, Some(1 << 30))
+            )
         );
         assert_eq!(
             super::client::request_dist_control(address, Some(2), Some(Some(1 << 20))).unwrap(),
-            builder_info("builder", limits(2, Some(1 << 20)))
+            builder_info(
+                &test_identity(Some(1500)),
+                cpu_model(),
+                limits(2, Some(1 << 20))
+            )
         );
         assert_eq!(live_limits.get(), limits(2, Some(1 << 20)));
         assert_eq!(
             super::client::request_dist_control(address, None, Some(None)).unwrap(),
-            builder_info("builder", limits(2, None))
+            builder_info(&test_identity(Some(1500)), cpu_model(), limits(2, None))
         );
         assert_eq!(live_limits.get(), limits(2, None));
 

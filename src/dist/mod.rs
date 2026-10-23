@@ -32,6 +32,8 @@ use crate::errors::*;
 mod cache;
 #[cfg(feature = "dist-client")]
 pub mod client_auth;
+#[cfg(feature = "dist-server")]
+pub mod cpu_speed;
 #[cfg(any_dist)]
 pub mod http;
 #[cfg(test)]
@@ -595,6 +597,8 @@ pub struct HeartbeatServerResult {
 pub struct BuilderInfo {
     pub name: String,
     pub num_cpus: usize,
+    pub cpu_model: Option<String>,
+    pub configured_cpu_speed: Option<u32>,
     pub limits: BuilderLimits,
 }
 
@@ -637,6 +641,24 @@ pub struct SchedulerStatusResult {
 pub struct ServerStatus {
     pub server_id: ServerId,
     pub info: BuilderInfo,
+    pub cpu_speed: CpuSpeed,
+}
+
+// The speed that the scheduler ranks a builder by, and where it comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CpuSpeed {
+    Configured(u32),
+    Table(u32),
+    Unknown,
+}
+impl CpuSpeed {
+    pub fn speed(self) -> Option<u32> {
+        match self {
+            CpuSpeed::Configured(speed) | CpuSpeed::Table(speed) => Some(speed),
+            CpuSpeed::Unknown => None,
+        }
+    }
 }
 
 // SubmitToolchain

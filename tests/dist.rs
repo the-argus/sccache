@@ -12,8 +12,8 @@ use crate::harness::{
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
 use sccache::dist::{
-    AssignJobResult, CompileCommand, InputsReader, JobId, JobState, RunJobResult, ServerIncoming,
-    ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
+    AssignJobResult, CompileCommand, CpuSpeed, InputsReader, JobId, JobState, RunJobResult,
+    ServerIncoming, ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
 };
 use sccache::server::ServerInfo;
 use std::ffi::OsStr;
@@ -149,6 +149,13 @@ fn test_dist_basic() {
         assert_eq!(0, info.stats.cache_hits.all());
         assert_eq!(1, info.stats.cache_misses.all());
     });
+
+    let status = system.scheduler_status();
+    assert_eq!(status.servers.len(), 1);
+    assert_eq!(
+        status.servers[0].cpu_speed,
+        CpuSpeed::Configured(harness::DIST_SERVER_CPU_SPEED)
+    );
 }
 
 // A compile error on the build server reached the client as "Compiler killed by signal 1" with exit
