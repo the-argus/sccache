@@ -279,6 +279,11 @@ harness = false
 name = "preprocessor_cache_bench"
 test = false
 
+[[example]]
+name = "cpu-speeds"
+required-features = ["dist-server"]
+test = true
+
 [lints]
 workspace = true
 

@@ -387,6 +387,10 @@ scheduler_url = "https://192.168.1.1"
 # local address that is used for sccache CLI to communicate with a locally
 # running build server
 #dist_control_address = "127.0.0.1:10502"
+# The speed of one core of this build server. It determines scheduling priority.
+# for reference, an Intel Core i7-8700K should get a score of 1000.
+# if unspecified, the scheduler tries to look at your CPU model
+#cpu_speed = 1500
 
 [builder]
 type = "overlay"
@@ -464,9 +468,9 @@ To set max jobs or max memory, use the `sccache` CLI (`dist-client` feature
 must have been enabled during build):
 
 ```
-# print name, number of CPUs, and limits according to the local build server,
-# for example:
-# {"name":"builder-1","num_cpus":16,"limits":{"max_jobs":19,"max_memory":68719476736}}
+# print name, number of CPUs, CPU model, configured cpu_speed, and limits
+# according to the local build server, for example:
+# {"name":"builder-1","num_cpus":16,"cpu_model":"AMD Ryzen 9 5950X 16-Core Processor","configured_cpu_speed":null,"limits":{"max_jobs":19,"max_memory":68719476736}}
 sccache --dist-builder-info
 # set the number of max jobs to 4 and then also print stats afterwards like
 # --dist-builder-info does
@@ -486,6 +490,25 @@ with a loopback address.
 The limits that the scheduler has received from each builder are listed under
 `servers` in the output of `sccache --dist-status`.
 
+
+#### Ranking build servers by CPU speed
+
+Among the available build servers, sccache will allocate jobs by a priority decided by CPU speed and current load. The equation to choose a builder is:
+
+```
+speed * (1 - 0.5 * running jobs / max_jobs)
+```
+
+This is taken from icecream. To decide the speed value, we look at the following, in order of priority:
+
+1. any explicitly specified `cpu_speed` score from the builder's config file
+2. looking up the relative ranking from (https://opendata.blender.org)
+3. otherwise the speed is considered to be unknown
+
+There are a lot of cases such as virtual machines, ARM machines, and some
+FreeBSD machines. The CPU estimation mechanism is generally considered a
+fallback and it is recommended to set explicit estimates in the config files of
+all builders.
 
 #### Memory limits
 

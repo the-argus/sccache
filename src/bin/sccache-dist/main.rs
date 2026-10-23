@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, btree_map};
 use std::env;
 use std::io;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -30,6 +31,7 @@ use std::time::{Duration, Instant};
 mod build;
 
 mod cmdline;
+mod cpu_speed;
 mod memory_history;
 #[cfg(target_os = "linux")]
 mod peak_memory;
@@ -258,6 +260,7 @@ fn run(command: Command) -> Result<i32> {
                 max_jobs,
                 max_memory,
                 dist_control_address,
+                cpu_speed,
             } = *config;
             let name = match name {
                 Some(name) => name,
@@ -330,7 +333,10 @@ fn run(command: Command) -> Result<i32> {
                 bind_address,
                 scheduler_url.to_url(),
                 scheduler_auth,
-                name,
+                dist::http::BuilderIdentity {
+                    name,
+                    configured_cpu_speed: cpu_speed.map(NonZeroU32::get),
+                },
                 max_jobs,
                 max_memory,
                 dist_control_address,
@@ -483,6 +489,34 @@ fn estimated_memory_of_jobs_on(
         .fold(0, u64::saturating_add)
 }
 
+// ranking for the relative performance of a build server.
+// This is ranked by estimated speed * (1 - 0.5 * jobs_assigned / max_jobs),
+// which is stolen from icecream
+struct Ranking {
+    cpu_speed: Option<u32>, // general speed score from database
+    jobs_assigned: usize,
+    max_jobs: usize,
+}
+
+impl Ranking {
+    // Mix all values into one score weighted by importance
+    fn scaled_score(&self, other_max_jobs: usize) -> u128 {
+        let speed = u128::from(self.cpu_speed.unwrap_or(0));
+        let free = (2 * self.max_jobs as u128).saturating_sub(self.jobs_assigned as u128);
+        speed
+            .saturating_mul(free)
+            .saturating_mul(other_max_jobs as u128)
+    }
+
+    fn is_better_than(&self, other: &Ranking) -> bool {
+        let score = self.scaled_score(other.max_jobs);
+        let other_score = other.scaled_score(self.max_jobs);
+        let load = self.jobs_assigned as u128 * other.max_jobs as u128;
+        let other_load = other.jobs_assigned as u128 * self.max_jobs as u128;
+        score > other_score || (score == other_score && load < other_load)
+    }
+}
+
 fn servers_named(servers: &HashMap<ServerId, ServerDetails>, name: &str) -> Vec<ServerId> {
     servers
         .iter()
@@ -511,7 +545,7 @@ impl SchedulerIncoming for Scheduler {
             let estimated_peak_memory = memory_measurements.estimate(&command_hash, &client_name);
             let res = {
                 let now = Instant::now();
-                let mut best: Option<(ServerId, f64)> = None;
+                let mut best: Option<(ServerId, Ranking)> = None;
                 let mut best_err: Option<(ServerId, Instant)> = None;
                 for (&server_id, details) in servers.iter_mut() {
                     let num_jobs_assigned = jobs_on(server_id, &jobs).count();
@@ -542,10 +576,17 @@ impl SchedulerIncoming for Scheduler {
                             best_err = Some((server_id, last_error));
                         }
                     } else {
-                        let load = num_jobs_assigned as f64 / max_jobs as f64;
-                        if best.is_none_or(|(_, best_load)| load < best_load) {
-                            trace!("Selected {:?} as the server with the best load", server_id);
-                            best = Some((server_id, load));
+                        let ranking = Ranking {
+                            cpu_speed: cpu_speed::cpu_speed_of_builder(&details.info).speed(),
+                            jobs_assigned: num_jobs_assigned,
+                            max_jobs,
+                        };
+                        if best
+                            .as_ref()
+                            .is_none_or(|(_, best_ranking)| ranking.is_better_than(best_ranking))
+                        {
+                            trace!("Selected {:?} as the best ranked server", server_id);
+                            best = Some((server_id, ranking));
                         }
                     }
                 }
@@ -855,6 +896,7 @@ impl SchedulerIncoming for Scheduler {
                 .map(|(&server_id, details)| ServerStatus {
                     server_id,
                     info: details.info.clone(),
+                    cpu_speed: cpu_speed::cpu_speed_of_builder(&details.info),
                 })
                 .collect(),
         })
@@ -977,7 +1019,8 @@ impl ServerIncoming for Server {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
-    use sccache::dist::BuilderLimits;
+    use sccache::dist::cpu_speed::{REFERENCE_CPU_MODEL, REFERENCE_CPU_SPEED};
+    use sccache::dist::{BuilderLimits, CpuSpeed};
 
     #[test]
     fn scheduler_instances_namespace_job_ids() {
@@ -1010,6 +1053,8 @@ mod scheduler_tests {
         BuilderInfo {
             name: name.to_owned(),
             num_cpus,
+            cpu_model: None,
+            configured_cpu_speed: None,
             limits: BuilderLimits {
                 max_jobs,
                 max_memory: None,
@@ -1903,6 +1948,275 @@ mod scheduler_tests {
         assert_eq!(
             status.servers[0].info,
             builder_info_with_memory_limits(3, Some(GIBIBYTE))
+        );
+    }
+
+    fn speed_builder_info(
+        name: &str,
+        cpu_model: Option<&str>,
+        configured_cpu_speed: Option<u32>,
+        max_jobs: usize,
+    ) -> BuilderInfo {
+        BuilderInfo {
+            cpu_model: cpu_model.map(str::to_owned),
+            configured_cpu_speed,
+            ..builder_info(name, 4, max_jobs)
+        }
+    }
+
+    const UNKNOWN_CPU: &str = "Epic Computer 3000";
+
+    #[test]
+    fn ranking() {
+        let scheduler = Scheduler::default();
+        let slow: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let fast: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            slow,
+            &ServerNonce::new(),
+            speed_builder_info("slow", Some(REFERENCE_CPU_MODEL), None, 4),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            fast,
+            &ServerNonce::new(),
+            speed_builder_info("fast", None, Some(REFERENCE_CPU_SPEED + 1), 4),
+        )
+        .unwrap();
+        assert_eq!(allocate(&scheduler), Some(fast));
+    }
+
+    #[test]
+    fn being_busy_deprioritizes_server_in_ranking() {
+        let scheduler = Scheduler::default();
+        let slow: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let fast: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            slow,
+            &ServerNonce::new(),
+            speed_builder_info("slow", None, Some(1500), 4),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            fast,
+            &ServerNonce::new(),
+            speed_builder_info("fast", None, Some(2000), 4),
+        )
+        .unwrap();
+
+        let alocation_results: Vec<_> = (0..8).map(|_| allocate(&scheduler).unwrap()).collect();
+        assert_eq!(
+            alocation_results,
+            // with the speed being weighted at 2x the business, it should look something like this
+            // given the speed of slow is 3/4 the speed of fast
+            vec![fast, fast, slow, fast, slow, fast, slow, slow]
+        );
+        assert_eq!(allocate(&scheduler), None);
+    }
+
+    #[test]
+    fn ranking_cares_more_about_speed() {
+        let ranking = |cpu_speed, jobs_assigned, max_jobs| Ranking {
+            cpu_speed,
+            jobs_assigned,
+            max_jobs,
+        };
+        struct Case {
+            first: Ranking,
+            second: Ranking,
+            first_is_better: bool,
+            second_is_better: bool,
+        };
+
+        let cases = [
+            Case {
+                first: ranking(Some(2000), 0, 4),
+                second: ranking(Some(1000), 0, 4),
+                first_is_better: true,
+                second_is_better: false,
+            },
+            Case {
+                first: ranking(Some(2000), 3, 4),
+                second: ranking(Some(1000), 0, 4),
+                first_is_better: true,
+                second_is_better: false,
+            },
+            Case {
+                first: ranking(Some(1000), 0, 4),
+                second: ranking(None, 0, 4),
+                first_is_better: true,
+                second_is_better: false,
+            },
+            // Equal scores, lower load.
+            Case {
+                first: ranking(Some(1000), 1, 2),
+                second: ranking(Some(750), 0, 4),
+                first_is_better: false,
+                second_is_better: true,
+            },
+            Case {
+                first: ranking(Some(150), 2, 3),
+                second: ranking(Some(100), 0, 1),
+                first_is_better: false,
+                second_is_better: true,
+            },
+            Case {
+                first: ranking(None, 1, 2),
+                second: ranking(None, 1, 4),
+                first_is_better: false,
+                second_is_better: true,
+            },
+            // Fully equal.
+            Case {
+                first: ranking(Some(1000), 1, 4),
+                second: ranking(Some(1000), 2, 8),
+                first_is_better: false,
+                second_is_better: false,
+            },
+            Case {
+                first: ranking(None, 1, 2),
+                second: ranking(None, 2, 4),
+                first_is_better: false,
+                second_is_better: false,
+            },
+        ];
+        for (
+            index,
+            Case {
+                first,
+                second,
+                first_is_better,
+                second_is_better,
+            },
+        ) in cases.iter().enumerate()
+        {
+            assert_eq!(first.is_better_than(second), *first_is_better, "{index}");
+            assert_eq!(second.is_better_than(first), *second_is_better, "{index}");
+        }
+    }
+
+    #[test]
+    fn dont_pick_unknown_speed_unless_no_others_are_available() {
+        let scheduler = Scheduler::default();
+        let known: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let unknown: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let no_model: ServerId = "127.0.0.3:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            known,
+            &ServerNonce::new(),
+            speed_builder_info("known", Some(REFERENCE_CPU_MODEL), None, 2),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            unknown,
+            &ServerNonce::new(),
+            speed_builder_info("unknown", Some(UNKNOWN_CPU), None, 2),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            no_model,
+            &ServerNonce::new(),
+            speed_builder_info("no-model", None, None, 4),
+        )
+        .unwrap();
+
+        assert_eq!(allocate(&scheduler), Some(known));
+        assert_eq!(allocate(&scheduler), Some(known));
+        // pick the one with lower load
+        let picked: Vec<_> = (0..6).map(|_| allocate(&scheduler).unwrap()).collect();
+        assert_eq!(picked.iter().filter(|&&id| id == unknown).count(), 2);
+        assert_eq!(picked.iter().filter(|&&id| id == no_model).count(), 4);
+        assert_eq!(allocate(&scheduler), None);
+    }
+
+    #[test]
+    fn server_is_faster_but_has_error() {
+        let scheduler = Scheduler::default();
+        let slow: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let fast: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            slow,
+            &ServerNonce::new(),
+            speed_builder_info("slow", Some(UNKNOWN_CPU), None, 1),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            fast,
+            &ServerNonce::new(),
+            speed_builder_info("fast", None, Some(2000), 4),
+        )
+        .unwrap();
+        set_last_error(&scheduler, fast, time_ago(Duration::from_secs(1)));
+
+        assert_eq!(allocate(&scheduler), Some(slow));
+        assert_eq!(allocate(&scheduler), Some(fast));
+    }
+
+    #[test]
+    fn get_cpu_speeds_with_dist_status() {
+        let scheduler = Scheduler::default();
+        let configured: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let table: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let unknown: ServerId = "127.0.0.3:10501".parse().unwrap();
+        let configured_nonce = ServerNonce::new();
+        heartbeat(
+            &scheduler,
+            configured,
+            &configured_nonce,
+            speed_builder_info("configured", Some(REFERENCE_CPU_MODEL), Some(1234), 4),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            table,
+            &ServerNonce::new(),
+            speed_builder_info("table", Some(REFERENCE_CPU_MODEL), None, 4),
+        )
+        .unwrap();
+        heartbeat(
+            &scheduler,
+            unknown,
+            &ServerNonce::new(),
+            speed_builder_info("unknown", Some(UNKNOWN_CPU), None, 4),
+        )
+        .unwrap();
+
+        let cpu_speeds = |scheduler: &Scheduler| -> HashMap<ServerId, CpuSpeed> {
+            let status = scheduler.handle_status().unwrap();
+            status
+                .servers
+                .into_iter()
+                .map(|server| (server.server_id, server.cpu_speed))
+                .collect()
+        };
+        assert_eq!(
+            cpu_speeds(&scheduler),
+            HashMap::from([
+                (configured, CpuSpeed::Configured(1234)),
+                (table, CpuSpeed::Table(REFERENCE_CPU_SPEED)),
+                (unknown, CpuSpeed::Unknown),
+            ])
+        );
+
+        heartbeat(
+            &scheduler,
+            configured,
+            &configured_nonce,
+            speed_builder_info("configured", Some(REFERENCE_CPU_MODEL), None, 4),
+        )
+        .unwrap();
+        assert_eq!(
+            cpu_speeds(&scheduler)[&configured],
+            CpuSpeed::Table(REFERENCE_CPU_SPEED)
         );
     }
 

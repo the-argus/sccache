@@ -42,6 +42,8 @@ const SCHEDULER_PORT: u16 = 10500;
 const SERVER_PORT: u16 = 12345; // arbitrary
 
 const TC_CACHE_SIZE: u64 = 1024 * 1024 * 1024; // 1 gig
+#[cfg(feature = "dist-server")]
+pub const DIST_SERVER_CPU_SPEED: u32 = 1500;
 
 pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     // Don't run this with run() because on Windows `wait_with_output`
@@ -241,6 +243,7 @@ fn sccache_server_cfg(
         max_jobs: sccache::config::server::default_max_jobs(),
         max_memory: sccache::config::server::default_max_memory(),
         dist_control_address,
+        cpu_speed: std::num::NonZeroU32::new(DIST_SERVER_CPU_SPEED),
     }
 }
 
@@ -510,7 +513,10 @@ impl DistSystem {
             Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
             self.scheduler_url().to_url(),
             token,
-            "custom-server".to_owned(),
+            dist::http::BuilderIdentity {
+                name: "custom-server".to_owned(),
+                configured_cpu_speed: Some(DIST_SERVER_CPU_SPEED),
+            },
             sccache::config::server::default_max_jobs(),
             sccache::config::server::default_max_memory(),
             dist_control_address,
@@ -636,7 +642,7 @@ impl DistSystem {
         );
     }
 
-    fn scheduler_status(&self) -> SchedulerStatusResult {
+    pub fn scheduler_status(&self) -> SchedulerStatusResult {
         let res = reqwest::blocking::get(dist::http::urls::scheduler_status(
             &self.scheduler_url().to_url(),
         ))

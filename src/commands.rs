@@ -1111,6 +1111,8 @@ mod test {
                 rouille::Response::json(&crate::dist::BuilderInfo {
                     name: "builder".to_owned(),
                     num_cpus: 4,
+                    cpu_model: None,
+                    configured_cpu_speed: None,
                     limits: crate::dist::BuilderLimits {
                         max_jobs: 3,
                         max_memory: None,
@@ -1140,7 +1142,7 @@ mod test {
         );
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "{\"name\":\"builder\",\"num_cpus\":4,\"limits\":{\"max_jobs\":3,\"max_memory\":null}}\n"
+            "{\"name\":\"builder\",\"num_cpus\":4,\"cpu_model\":null,\"configured_cpu_speed\":null,\"limits\":{\"max_jobs\":3,\"max_memory\":null}}\n"
         );
 
         requests.lock().unwrap().clear();

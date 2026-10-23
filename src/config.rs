@@ -1748,6 +1748,7 @@ pub mod server {
         pub max_memory: Option<u64>,
         #[serde(default = "default_dist_control_address")]
         pub dist_control_address: SocketAddr,
+        pub cpu_speed: Option<std::num::NonZeroU32>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3200,6 +3201,7 @@ fn server_toml_parse() {
             max_jobs: server::default_max_jobs(),
             max_memory: Some(8 * 1024 * 1024 * 1024),
             dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
+            cpu_speed: None,
         }
     )
 }
@@ -3214,6 +3216,7 @@ fn server_toml_parse_builder_settings() {
     name = "builder-a"
     max_jobs = 3
     dist_control_address = "127.0.0.1:20502"
+    cpu_speed = 1500
 
     [builder]
     type = "docker"
@@ -3229,6 +3232,11 @@ fn server_toml_parse_builder_settings() {
         server_config.dist_control_address,
         "127.0.0.1:20502".parse::<std::net::SocketAddr>().unwrap()
     );
+    assert_eq!(server_config.cpu_speed, std::num::NonZeroU32::new(1500));
+
+    // 0 would rank the builder like one of unknown speed.
+    let zero_speed = CONFIG_STR.replace("cpu_speed = 1500", "cpu_speed = 0");
+    assert!(toml::from_str::<server::Config>(&zero_speed).is_err());
 }
 
 #[test]
