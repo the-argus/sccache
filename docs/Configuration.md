@@ -45,12 +45,6 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 # (see Distributed.md, Changing max_jobs and max_memory at runtime)
 # default value is 127.0.0.1:10502
 # dist_control_address = "127.0.0.1:10502"
-# idenfities the machine to the scheduler, which is used to do memory usage
-# estimates, assuming that a given requested client who requests very
-# memory-hungry jobs will continue to do so, which helps to predict and prevent
-# OOM. this is the client's hostname by default. It needs to be unique for
-# memory usage prediction to work properly.
-# name = "workstation-1"
 
 [dist.auth]
 type = "token"

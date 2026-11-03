@@ -1117,6 +1117,8 @@ mod test {
                         max_jobs: 3,
                         max_memory: None,
                     },
+                    available_memory: None,
+                    running_jobs_memory: Vec::new(),
                 })
             })
             .unwrap()
@@ -1142,7 +1144,7 @@ mod test {
         );
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "{\"name\":\"builder\",\"num_cpus\":4,\"cpu_model\":null,\"configured_cpu_speed\":null,\"limits\":{\"max_jobs\":3,\"max_memory\":null}}\n"
+            "{\"name\":\"builder\",\"num_cpus\":4,\"cpu_model\":null,\"configured_cpu_speed\":null,\"limits\":{\"max_jobs\":3,\"max_memory\":null},\"available_memory\":null,\"running_jobs_memory\":[]}\n"
         );
 
         requests.lock().unwrap().clear();

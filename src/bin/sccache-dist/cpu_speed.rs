@@ -70,6 +70,8 @@ mod tests {
                 max_jobs: 4,
                 max_memory: None,
             },
+            available_memory: None,
+            running_jobs_memory: Vec::new(),
         }
     }
 

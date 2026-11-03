@@ -1,22 +1,37 @@
+use sccache::dist::{JobId, RunningJobMemory};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Command::output(), except it also returns the peak memory usage of the command and all its
-/// children
-pub fn output_with_peak_memory(command: &mut Command) -> io::Result<(Output, Option<u64>)> {
-    output_with_peak_memory_sampled(command, sample_tree_memory, SAMPLE_INTERVAL)
+/// children.
+pub fn output_with_peak_memory(
+    command: &mut Command,
+    job_id: JobId,
+    shared_job_processes: &Mutex<HashMap<JobId, u32>>,
+) -> io::Result<(Output, Option<u64>)> {
+    output_with_peak_memory_sampled(
+        command,
+        job_id,
+        shared_job_processes,
+        sample_tree_memory,
+        SAMPLE_INTERVAL,
+    )
 }
 
+/// Runs the command and stores the running process's ID into shared_job_processes until the process
+/// exits
 fn output_with_peak_memory_sampled(
     command: &mut Command,
+    job_id: JobId,
+    shared_job_processes: &Mutex<HashMap<JobId, u32>>,
     // called with the process ID of every child process periodically
     // guaranteed to be called at least once
     mut sample: impl FnMut(u32) -> u64,
@@ -28,6 +43,10 @@ fn output_with_peak_memory_sampled(
         .stderr(Stdio::piped())
         .spawn()?;
     let process_id = child.id();
+    shared_job_processes
+        .lock()
+        .unwrap()
+        .insert(job_id, process_id);
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
 
@@ -61,6 +80,8 @@ fn output_with_peak_memory_sampled(
             }
         };
 
+        // do before reaping the process to prevent it being reused by the OS while it still exists in shared_job_processes
+        shared_job_processes.lock().unwrap().remove(&job_id);
         // now reap the zombie child >:D
         let reaped = reap(process_id);
         exited?;
@@ -124,14 +145,55 @@ fn reap(process_id: u32) -> io::Result<(ExitStatus, u64)> {
 
 // get the sum of all max memory usage below a root process
 fn sample_tree_memory(root: u32) -> u64 {
-    process_tree(root, &process_parents())
+    tree_memory(root, &process_parents()).peak
+}
+
+pub fn get_running_jobs_memory(
+    shared_job_processes: &Mutex<HashMap<JobId, u32>>,
+) -> Vec<RunningJobMemory> {
+    // holding this mutex also stops other threads from killing any jobs
+    let shared_job_processes = shared_job_processes.lock().unwrap();
+    let parents = process_parents();
+    shared_job_processes
+        .iter()
+        .map(|(&job_id, &root)| {
+            let TreeMemory { current, peak } = tree_memory(root, &parents);
+            RunningJobMemory {
+                job_id,
+                current,
+                peak,
+            }
+        })
+        .collect()
+}
+
+struct TreeMemory {
+    current: u64,
+    peak: u64,
+}
+
+// sums of the current and max memory usage of a process and all its descendants
+fn tree_memory(root: u32, parents: &HashMap<u32, u32>) -> TreeMemory {
+    process_tree(root, parents)
         .into_iter()
         .filter_map(|process_id| {
             // if process exits then filter it out, perhaps unfortunately
             let status = fs::read_to_string(format!("/proc/{process_id}/status")).ok()?;
-            parse_peak_resident_set_size(&status)
+            Some((
+                parse_resident_set_size(&status).unwrap_or(0),
+                parse_peak_resident_set_size(&status).unwrap_or(0),
+            ))
         })
-        .fold(0, u64::saturating_add)
+        .fold(
+            TreeMemory {
+                current: 0,
+                peak: 0,
+            },
+            |sum, (memory_current, memory_peak)| TreeMemory {
+                current: sum.current.saturating_add(memory_current),
+                peak: sum.peak.saturating_add(memory_peak),
+            },
+        )
 }
 
 fn process_parents() -> HashMap<u32, u32> {
@@ -171,9 +233,16 @@ fn parse_stat_parent(stat: &str) -> Option<u32> {
 
 // uses /proc/N/status to get the peak memory usage in bytes
 fn parse_peak_resident_set_size(status: &str) -> Option<u64> {
-    let value = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))?;
+    parse_status_bytes(status, "VmHWM:")
+}
+
+// uses /proc/N/status to get the current memory usage in bytes
+fn parse_resident_set_size(status: &str) -> Option<u64> {
+    parse_status_bytes(status, "VmRSS:")
+}
+
+fn parse_status_bytes(status: &str, field: &str) -> Option<u64> {
+    let value = status.lines().find_map(|line| line.strip_prefix(field))?;
     let kibibytes = value
         .trim()
         .strip_suffix("kB")?
@@ -258,6 +327,8 @@ mod tests {
         let mut calls = 0;
         let (output, peak_memory) = output_with_peak_memory_sampled(
             &mut wait_until_file_exists(&marker),
+            JobId(1),
+            &Mutex::default(),
             |_| {
                 let sample = fake_memory_peak_samples.get(calls).copied().unwrap_or(0);
                 calls += 1;
@@ -276,9 +347,14 @@ mod tests {
 
     #[test]
     fn samples_or_else_max_rss() {
-        let (output, peak_memory) =
-            output_with_peak_memory_sampled(Command::new("true").arg("x"), |_| 0, SAMPLE_INTERVAL)
-                .unwrap();
+        let (output, peak_memory) = output_with_peak_memory_sampled(
+            Command::new("true").arg("x"),
+            JobId(1),
+            &Mutex::default(),
+            |_| 0,
+            SAMPLE_INTERVAL,
+        )
+        .unwrap();
         assert!(output.status.success());
         assert!(peak_memory.is_some_and(|peak_memory| peak_memory > 0));
     }
@@ -290,6 +366,8 @@ mod tests {
         let mut first_sample = None;
         let (output, peak_memory) = output_with_peak_memory_sampled(
             &mut wait_until_file_exists(&marker),
+            JobId(1),
+            &Mutex::default(),
             |process_id| {
                 let sample = sample_tree_memory(process_id);
                 if first_sample.is_none() {
@@ -308,11 +386,54 @@ mod tests {
     }
 
     #[test]
+    fn running_jobs_reflected_in_shared_job_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("marker");
+        let shared_job_processes = Mutex::default();
+        let mut running_jobs_memory = None;
+        let (output, _) = output_with_peak_memory_sampled(
+            &mut wait_until_file_exists(&marker),
+            JobId(7),
+            &shared_job_processes,
+            |process_id| {
+                if running_jobs_memory.is_none() {
+                    assert_eq!(
+                        *shared_job_processes.lock().unwrap(),
+                        HashMap::from([(JobId(7), process_id)])
+                    );
+                    running_jobs_memory = Some(get_running_jobs_memory(&shared_job_processes));
+                    fs::write(&marker, "").unwrap();
+                }
+                0
+            },
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(shared_job_processes.lock().unwrap().is_empty());
+
+        let running_jobs_memory = running_jobs_memory.unwrap();
+        assert_eq!(running_jobs_memory.len(), 1);
+        assert_eq!(running_jobs_memory[0].job_id, JobId(7));
+        assert!(running_jobs_memory[0].current > 0);
+        assert!(running_jobs_memory[0].peak >= running_jobs_memory[0].current);
+    }
+
+    #[test]
+    fn parse_resident_set_size_kibibytes() {
+        let status = "Name:\tcc1plus\nVmHWM:\t  524288 kB\nVmRSS:\t  1000 kB\n";
+        assert_eq!(parse_resident_set_size(status), Some(1000 * 1024));
+        assert_eq!(parse_resident_set_size("Name:\tkthreadd\n"), None);
+    }
+
+    #[test]
     fn test_command_output() {
         let (output, peak_memory) = output_with_peak_memory(
             Command::new("sh")
                 .arg("-c")
                 .arg("echo out; echo err >&2; head -c 1000000 /dev/zero; exit 3"),
+            JobId(1),
+            &Mutex::default(),
         )
         .unwrap();
         assert_eq!(output.status.code(), Some(3));
@@ -325,11 +446,17 @@ mod tests {
     #[test]
     fn test_grandchild_process() {
         const BUFFER: u64 = 64 * 1024 * 1024;
-        let (output, peak_memory) = output_with_peak_memory(Command::new("sh").arg("-c").arg(
-            // use dd bs= because it must allocate a buffer that big, so we can assume that is a
-            // minimum memory usage
-            format!("sh -c 'dd if=/dev/zero of=/dev/null bs={BUFFER} count=1 2>/dev/null'; true"),
-        ))
+        let (output, peak_memory) = output_with_peak_memory(
+            Command::new("sh").arg("-c").arg(
+                // use dd bs= because it must allocate a buffer that big, so we can assume that is
+                // a minimum memory usage
+                format!(
+                    "sh -c 'dd if=/dev/zero of=/dev/null bs={BUFFER} count=1 2>/dev/null'; true"
+                ),
+            ),
+            JobId(1),
+            &Mutex::default(),
+        )
         .unwrap();
         assert!(output.status.success());
         let peak_memory = peak_memory.unwrap();

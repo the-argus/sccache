@@ -13,7 +13,8 @@ use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
 use sccache::dist::{
     AssignJobResult, CompileCommand, CpuSpeed, InputsReader, JobId, JobState, RunJobResult,
-    ServerIncoming, ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
+    RunningJobMemory, ServerIncoming, ServerOutgoing, SubmitToolchainResult, Toolchain,
+    ToolchainReader,
 };
 use sccache::server::ServerInfo;
 use std::ffi::OsStr;
@@ -392,7 +393,7 @@ fn test_dist_max_memory_via_dist_control() {
 
     const HALF_GIBIBYTE: u64 = 512 * 1024 * 1024;
 
-    // default guess for memory usage is 1GB which is too much
+    // this scheduler assumed 1GB worst case, which is too much
     set_builder_max_memory(&system, &sccache_config_path, "512M", Some(HALF_GIBIBYTE));
     basic_compile(
         temporary_directory,
@@ -415,8 +416,7 @@ fn test_dist_max_memory_via_dist_control() {
         assert_eq!(1, info.stats.dist_errors);
     });
 
-    // now that the compilation has been registered as requiring very little memory, the next
-    // unknown request from the same client should be assumed to be about the same
+    // another unknown command continues to be expected to be worst case usage
     set_builder_max_memory(&system, &sccache_config_path, "512M", Some(HALF_GIBIBYTE));
     compile_c_file(
         temporary_directory,
@@ -425,8 +425,8 @@ fn test_dist_max_memory_via_dist_control() {
         "y",
     );
     get_stats(|info| {
-        assert_eq!(2, info.stats.dist_compiles.values().sum::<usize>());
-        assert_eq!(1, info.stats.dist_errors);
+        assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(2, info.stats.dist_errors);
     });
 }
 
@@ -492,6 +492,9 @@ impl ServerIncoming for FailingServer {
             .do_update_job_state(job_id, JobState::Started)
             .context("Updating job state failed")?;
         bail!("internal build failure")
+    }
+    fn running_jobs_memory(&self) -> Vec<RunningJobMemory> {
+        Vec::new()
     }
 }
 

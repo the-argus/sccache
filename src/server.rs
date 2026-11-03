@@ -160,7 +160,6 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
-    name: Option<String>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -217,7 +216,6 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
-            name: config.dist.name.clone(),
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -376,13 +374,6 @@ impl DistClientContainer {
                     auth_token
                         .context("could not load client auth token, run |sccache --dist-auth|")
                 );
-                let name = match &config.name {
-                    Some(name) => Ok(name.clone()),
-                    None => hostname::get()
-                        .map(|hostname| hostname.to_string_lossy().into_owned())
-                        .context("Failed to get the hostname to use as the dist client name"),
-                };
-                let name = try_or_fail_with_message!(name);
                 let dist_client = dist::http::Client::new(
                     &config.pool,
                     url,
@@ -391,7 +382,6 @@ impl DistClientContainer {
                     &config.toolchains,
                     auth_token,
                     config.rewrite_includes_only,
-                    name,
                 );
                 let dist_client =
                     try_or_retry_later!(dist_client.context("failure during dist client creation"));
@@ -1107,7 +1097,6 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
-                    name: None,
                 }),
                 dist_client,
             ))),
@@ -2618,7 +2607,6 @@ mod tests {
             toolchain_cache_size: 0,
             toolchains: vec![],
             rewrite_includes_only: false,
-            name: None,
         };
         let container = DistClientContainer::new_with_state(DistClientState::RetryCreateAt(
             Box::new(config),

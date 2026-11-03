@@ -16,6 +16,8 @@ use crate::compiler;
 use async_trait::async_trait;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Deserializer, Serialize};
+#[cfg(feature = "dist-server")]
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
@@ -600,6 +602,17 @@ pub struct BuilderInfo {
     pub cpu_model: Option<String>,
     pub configured_cpu_speed: Option<u32>,
     pub limits: BuilderLimits,
+    pub available_memory: Option<u64>, // MemAvailable
+    pub running_jobs_memory: Vec<RunningJobMemory>,
+}
+
+// memory used by the process tree of a job's compiler, in bytes
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningJobMemory {
+    pub job_id: JobId,
+    pub current: u64,
+    pub peak: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,7 +762,6 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
         command_hash: CommandHash,
-        client_name: String,
     ) -> ExtResult<AllocJobResult, Error>;
     // From Server
     fn handle_heartbeat_server(
@@ -797,11 +809,13 @@ pub trait ServerIncoming: Send + Sync {
         outputs: Vec<String>,
         inputs_rdr: InputsReader<'_>,
     ) -> ExtResult<RunJobResult, Error>;
+    fn running_jobs_memory(&self) -> Vec<RunningJobMemory>;
 }
 
 #[cfg(feature = "dist-server")]
 pub trait BuilderIncoming: Send + Sync {
     // From Server
+    #[allow(clippy::too_many_arguments)]
     fn run_build(
         &self,
         toolchain: Toolchain,
@@ -809,6 +823,8 @@ pub trait BuilderIncoming: Send + Sync {
         outputs: Vec<String>,
         inputs_rdr: InputsReader<'_>,
         cache: &Mutex<TcCache>,
+        job_id: JobId,
+        shared_job_processes: &Mutex<HashMap<JobId, u32>>,
     ) -> ExtResult<BuildResult, Error>;
 }
 

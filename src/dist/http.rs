@@ -97,7 +97,6 @@ mod common {
     pub struct AllocJobHttpRequest {
         pub toolchain: dist::Toolchain,
         pub command_hash: dist::CommandHash,
-        pub client_name: String,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,9 +311,9 @@ mod server {
     use super::urls;
     use crate::dist::{
         self, AllocJobResult, AssignJobResult, BuilderInfo, BuilderLimits, HeartbeatServerResult,
-        InputsReader, JobAuthorizer, JobId, JobState, RunJobResult, SchedulerStatusResult,
-        ServerId, ServerNonce, SubmitToolchainResult, Toolchain, ToolchainReader,
-        UpdateJobStateResult,
+        InputsReader, JobAuthorizer, JobId, JobState, RunJobResult, RunningJobMemory,
+        SchedulerStatusResult, ServerId, ServerNonce, SubmitToolchainResult, Toolchain,
+        ToolchainReader, UpdateJobStateResult,
     };
     use crate::errors::*;
 
@@ -878,10 +877,10 @@ mod server {
                                 return make_401_with_body("bearer_auth_failed", client_msg)
                             },
                         }
-                        let AllocJobHttpRequest { toolchain, command_hash, client_name } = try_or_400_log!(req_id, bincode_input(request));
-                        trace!("Req {}: alloc_job: {:?} {:?} from {:?}", req_id, toolchain, command_hash, client_name);
+                        let AllocJobHttpRequest { toolchain, command_hash } = try_or_400_log!(req_id, bincode_input(request));
+                        trace!("Req {}: alloc_job: {:?} {:?}", req_id, toolchain, command_hash);
 
-                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester, toolchain, command_hash, client_name));
+                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester, toolchain, command_hash));
                         let certs = server_certificates.lock().unwrap();
                         let res = AllocJobHttpResponse::from_alloc_job_result(alloc_job_res, &certs);
                         prepare_response(request, &res)
@@ -1053,10 +1052,25 @@ mod server {
                 handler,
             } = self;
 
+            let handler = Arc::new(handler);
+            let current_builder_info: Arc<dyn Fn() -> BuilderInfo + Send + Sync> = {
+                let limits = limits.clone();
+                let handler = handler.clone();
+                Arc::new(move || {
+                    builder_info(
+                        &identity,
+                        cpu_model(),
+                        limits.get(),
+                        available_memory(),
+                        handler.running_jobs_memory(),
+                    )
+                })
+            };
+
             let dist_control_address = start_dist_control_listener(
                 dist_control_address,
-                identity.clone(),
                 limits.clone(),
+                current_builder_info.clone(),
             )?;
             info!(
                 "Server listening for control requests on {}",
@@ -1072,6 +1086,7 @@ mod server {
                     .context("failed to build scheduler requester HTTP client")?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
+                limits: limits.clone(),
             };
             let heartbeat_client =
                 new_reqwest_blocking_client().context("failed to build heartbeat HTTP client")?;
@@ -1081,7 +1096,7 @@ mod server {
                 loop {
                     let heartbeat_request = HeartbeatServerHttpRequest {
                         jwt_key: heartbeat_jwt_key.clone(),
-                        info: builder_info(&identity, cpu_model(), limits.get()),
+                        info: current_builder_info(),
                         server_nonce: server_nonce.clone(),
                         cert_digest: cert_digest.clone(),
                         cert_pem: heartbeat_cert_pem.clone(),
@@ -1107,7 +1122,7 @@ mod server {
                             HEARTBEAT_ERROR_INTERVAL
                         }
                     };
-                    limits.wait_for_change(heartbeat_request.info.limits, wait);
+                    limits.wait_for_heartbeat_request(wait);
                 }
             });
 
@@ -1174,37 +1189,52 @@ mod server {
     }
 
     // mechanism to sleep the heartbeat-sending thread for brief periods but also allow waking it up
-    // whenever the user requests a change to the limits via the local dist_control endpoint
+    // when needed:
+    // - if the user requests a change to the limits via the local dist_control endpoint
+    // - if a job completes
     struct LiveLimits {
-        current: Mutex<BuilderLimits>,
+        state: Mutex<LiveLimitsState>,
         changed: Condvar,
     }
 
+    struct LiveLimitsState {
+        limits: BuilderLimits,
+        heartbeat_requested: bool,
+    }
+
     impl LiveLimits {
-        fn new(current: BuilderLimits) -> Self {
+        fn new(limits: BuilderLimits) -> Self {
             Self {
-                current: Mutex::new(current),
+                state: Mutex::new(LiveLimitsState {
+                    limits,
+                    heartbeat_requested: false,
+                }),
                 changed: Condvar::new(),
             }
         }
         fn get(&self) -> BuilderLimits {
-            *self.current.lock().unwrap()
+            self.state.lock().unwrap().limits
         }
-        fn update(&self, change: impl FnOnce(&mut BuilderLimits)) -> BuilderLimits {
-            let mut current = self.current.lock().unwrap();
-            change(&mut current);
+        fn update(&self, change: impl FnOnce(&mut BuilderLimits)) {
+            let mut state = self.state.lock().unwrap();
+            change(&mut state.limits);
+            state.heartbeat_requested = true;
             self.changed.notify_all();
-            *current
+        }
+        fn request_heartbeat(&self) {
+            self.state.lock().unwrap().heartbeat_requested = true;
+            self.changed.notify_all();
         }
 
-        // also wakes up if the user requested a change to the limits
-        fn wait_for_change(&self, sent: BuilderLimits, timeout: Duration) {
-            let _ = self
+        // immediately returns if a heartbeat is already received
+        fn wait_for_heartbeat_request(&self, timeout: Duration) {
+            let (mut state, _) = self
                 .changed
-                .wait_timeout_while(self.current.lock().unwrap(), timeout, |current| {
-                    *current == sent
+                .wait_timeout_while(self.state.lock().unwrap(), timeout, |state| {
+                    !state.heartbeat_requested
                 })
                 .unwrap();
+            state.heartbeat_requested = false;
         }
     }
 
@@ -1218,6 +1248,8 @@ mod server {
         identity: &BuilderIdentity,
         cpu_model: Option<String>,
         limits: BuilderLimits,
+        available_memory: Option<u64>,
+        running_jobs_memory: Vec<RunningJobMemory>,
     ) -> BuilderInfo {
         BuilderInfo {
             name: identity.name.clone(),
@@ -1225,7 +1257,26 @@ mod server {
             cpu_model,
             configured_cpu_speed: identity.configured_cpu_speed,
             limits,
+            available_memory,
+            running_jobs_memory,
         }
+    }
+
+    fn available_memory() -> Option<u64> {
+        if cfg!(target_os = "linux") {
+            parse_available_memory(&std::fs::read_to_string("/proc/meminfo").ok()?)
+        } else {
+            None
+        }
+    }
+
+    // get MemAvailable from /proc/meminfo in bytes
+    fn parse_available_memory(meminfo: &str) -> Option<u64> {
+        let line = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+        let kibibytes = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+        kibibytes.checked_mul(1024)
     }
 
     fn cpu_model() -> Option<String> {
@@ -1243,8 +1294,8 @@ mod server {
 
     fn start_dist_control_listener(
         dist_control_address: SocketAddr,
-        identity: Arc<BuilderIdentity>,
         limits: Arc<LiveLimits>,
+        current_builder_info: Arc<dyn Fn() -> BuilderInfo + Send + Sync>,
     ) -> Result<SocketAddr> {
         let request_count = atomic::AtomicUsize::new(0);
         let server = rouille::Server::new(dist_control_address, move |request| {
@@ -1252,7 +1303,7 @@ mod server {
                 "control-{}",
                 request_count.fetch_add(1, atomic::Ordering::SeqCst)
             );
-            control_response(&request_id, request, &identity, cpu_model(), &limits)
+            control_response(&request_id, request, &limits, &*current_builder_info)
         })
         .map_err(|error| {
             anyhow!(
@@ -1270,31 +1321,30 @@ mod server {
     fn control_response(
         request_id: &str,
         request: &rouille::Request,
-        identity: &BuilderIdentity,
-        cpu_model: Option<String>,
         limits: &LiveLimits,
+        current_builder_info: &dyn Fn() -> BuilderInfo,
     ) -> rouille::Response {
         trace!("Request {}: {:?}", request_id, request);
         router!(request,
             (GET) (/api/v1/control/builder_info) => {
-                rouille::Response::json(&builder_info(identity, cpu_model.clone(), limits.get()))
+                rouille::Response::json(&current_builder_info())
             },
             (PUT) (/api/v1/control/max_jobs) => {
                 let SetMaxJobsLocalHttpRequest { max_jobs } =
                     try_or_400_log!(request_id, rouille::input::json_input(request));
-                let new_limits = limits.update(|limits| limits.max_jobs = max_jobs);
+                limits.update(|limits| limits.max_jobs = max_jobs);
                 info!("max_jobs set to {} through the dist control listener", max_jobs);
-                rouille::Response::json(&builder_info(identity, cpu_model.clone(), new_limits))
+                rouille::Response::json(&current_builder_info())
             },
             (PUT) (/api/v1/control/max_memory) => {
                 let SetMaxMemoryLocalHttpRequest { max_memory } =
                     try_or_400_log!(request_id, rouille::input::json_input(request));
-                let new_limits = limits.update(|limits| limits.max_memory = max_memory);
+                limits.update(|limits| limits.max_memory = max_memory);
                 match max_memory {
                     Some(max_memory) => info!("max_memory set to {} bytes through the dist control listener", max_memory),
                     None => info!("max_memory turned off through the dist control listener"),
                 }
-                rouille::Response::json(&builder_info(identity, cpu_model.clone(), new_limits))
+                rouille::Response::json(&current_builder_info())
             },
             _ => {
                 warn!("Unknown dist control request {:?}", request);
@@ -1325,6 +1375,21 @@ mod server {
     }
 
     #[cfg(test)]
+    fn test_builder_info(limits: BuilderLimits) -> BuilderInfo {
+        builder_info(
+            &test_identity(None),
+            test_cpu_model(),
+            limits,
+            Some(1 << 30),
+            vec![RunningJobMemory {
+                job_id: JobId(1),
+                current: 1 << 20,
+                peak: 1 << 21,
+            }],
+        )
+    }
+
+    #[cfg(test)]
     fn put_json(path: &str, body: &str) -> rouille::Request {
         rouille::Request::fake_http(
             "PUT",
@@ -1344,51 +1409,31 @@ mod server {
     #[test]
     fn set_and_get_max_jobs() {
         let live_limits = LiveLimits::new(limits(4, None));
+        let current_info = || test_builder_info(live_limits.get());
         let get = || {
             let request =
                 rouille::Request::fake_http("GET", "/api/v1/control/builder_info", vec![], vec![]);
-            control_response(
-                "test",
-                &request,
-                &test_identity(None),
-                test_cpu_model(),
-                &live_limits,
-            )
+            control_response("test", &request, &live_limits, &current_info)
         };
 
         let info = response_builder_info(get());
         assert_eq!(info.cpu_model.as_deref(), Some("Test CPU @ 1.00GHz"));
-        assert_eq!(
-            info,
-            builder_info(&test_identity(None), test_cpu_model(), limits(4, None))
-        );
+        assert_eq!(info, test_builder_info(limits(4, None)));
 
         let request = put_json("/api/v1/control/max_jobs", r#"{"max_jobs": 0}"#);
-        let response = control_response(
-            "test",
-            &request,
-            &test_identity(None),
-            test_cpu_model(),
-            &live_limits,
-        );
+        let response = control_response("test", &request, &live_limits, &current_info);
         assert_eq!(
             response_builder_info(response),
-            builder_info(&test_identity(None), test_cpu_model(), limits(0, None))
+            test_builder_info(limits(0, None))
         );
         assert_eq!(live_limits.get(), limits(0, None));
         assert_eq!(
             response_builder_info(get()),
-            builder_info(&test_identity(None), test_cpu_model(), limits(0, None))
+            test_builder_info(limits(0, None))
         );
 
         let request = put_json("/api/v1/control/max_jobs", r#"{"max_jobs": -1}"#);
-        let response = control_response(
-            "test",
-            &request,
-            &test_identity(None),
-            test_cpu_model(),
-            &live_limits,
-        );
+        let response = control_response("test", &request, &live_limits, &current_info);
         assert_eq!(response.status_code, 400);
         assert_eq!(live_limits.get(), limits(0, None));
     }
@@ -1396,52 +1441,31 @@ mod server {
     #[test]
     fn set_and_clear_max_memory() {
         let live_limits = LiveLimits::new(limits(4, None));
+        let current_info = || test_builder_info(live_limits.get());
 
         let request = put_json(
             "/api/v1/control/max_memory",
             r#"{"max_memory": 1073741824}"#,
         );
-        let response = control_response(
-            "test",
-            &request,
-            &test_identity(None),
-            test_cpu_model(),
-            &live_limits,
-        );
+        let response = control_response("test", &request, &live_limits, &current_info);
         assert_eq!(
             response_builder_info(response),
-            builder_info(
-                &test_identity(None),
-                test_cpu_model(),
-                limits(4, Some(1 << 30))
-            )
+            test_builder_info(limits(4, Some(1 << 30)))
         );
         assert_eq!(live_limits.get(), limits(4, Some(1 << 30)));
 
         for body in [r#"{"max_memory": -1}"#, r#"{"max_memory": "1G"}"#, r#"{}"#] {
             let request = put_json("/api/v1/control/max_memory", body);
-            let response = control_response(
-                "test",
-                &request,
-                &test_identity(None),
-                test_cpu_model(),
-                &live_limits,
-            );
+            let response = control_response("test", &request, &live_limits, &current_info);
             assert_eq!(response.status_code, 400, "{body}");
         }
         assert_eq!(live_limits.get(), limits(4, Some(1 << 30)));
 
         let request = put_json("/api/v1/control/max_memory", r#"{"max_memory": null}"#);
-        let response = control_response(
-            "test",
-            &request,
-            &test_identity(None),
-            test_cpu_model(),
-            &live_limits,
-        );
+        let response = control_response("test", &request, &live_limits, &current_info);
         assert_eq!(
             response_builder_info(response),
-            builder_info(&test_identity(None), test_cpu_model(), limits(4, None))
+            test_builder_info(limits(4, None))
         );
         assert_eq!(live_limits.get(), limits(4, None));
     }
@@ -1455,13 +1479,43 @@ mod server {
                 live_limits.update(|limits| limits.max_jobs = 7);
             })
         };
-        live_limits.wait_for_change(limits(4, None), Duration::MAX);
+        live_limits.wait_for_heartbeat_request(Duration::MAX);
         assert_eq!(live_limits.get(), limits(7, None));
         setter.join().unwrap();
 
         live_limits.update(|limits| limits.max_memory = Some(1 << 30));
-        live_limits.wait_for_change(limits(7, None), Duration::MAX);
+        live_limits.wait_for_heartbeat_request(Duration::MAX);
         assert_eq!(live_limits.get(), limits(7, Some(1 << 30)));
+
+        // the request was consumed last time we waited
+        let start = std::time::Instant::now();
+        live_limits.wait_for_heartbeat_request(Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn completing_job_wakes_up_heartbeat_thread() {
+        use dist::ServerOutgoing;
+
+        let live_limits = Arc::new(LiveLimits::new(limits(4, None)));
+        let unused_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let requester = ServerRequester {
+            client: new_reqwest_blocking_client().unwrap(),
+            scheduler_url: reqwest::Url::parse(&format!("http://127.0.0.1:{unused_port}")).unwrap(),
+            scheduler_auth: String::new(),
+            limits: live_limits.clone(),
+        };
+        let completer = thread::spawn(move || {
+            // there is no scheduler, but a heartbeat is still needed
+            assert!(requester.do_complete_job(JobId(1), Some(1 << 20)).is_err());
+        });
+        live_limits.wait_for_heartbeat_request(Duration::MAX);
+        completer.join().unwrap();
+        assert_eq!(live_limits.get(), limits(4, None));
     }
 
     #[test]
@@ -1498,6 +1552,23 @@ CPU revision\t: 1
         assert_eq!(parse_cpu_model(""), None);
     }
 
+    #[test]
+    fn parse_available_memory_from_meminfo() {
+        const MEMINFO: &str = "\
+MemTotal:       65536000 kB
+MemFree:         1234567 kB
+MemAvailable:   40000000 kB
+";
+        assert_eq!(parse_available_memory(MEMINFO), Some(40000000 * 1024));
+        assert_eq!(parse_available_memory("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_available_memory("MemAvailable: many kB\n"), None);
+        assert_eq!(parse_available_memory("MemAvailable: 1024\n"), None);
+        assert_eq!(
+            parse_available_memory("MemFree:  1 kB\nMemAvailable:\t 2 kB\n"),
+            Some(2048)
+        );
+    }
+
     #[cfg(test)]
     struct UnusedServerIncoming;
 
@@ -1528,6 +1599,9 @@ CPU revision\t: 1
         ) -> Result<RunJobResult> {
             unreachable!()
         }
+        fn running_jobs_memory(&self) -> Vec<RunningJobMemory> {
+            unreachable!()
+        }
     }
 
     #[test]
@@ -1552,42 +1626,34 @@ CPU revision\t: 1
     #[test]
     fn make_dist_controls_api_request() {
         let live_limits = Arc::new(LiveLimits::new(limits(4, None)));
-        let address = start_dist_control_listener(
-            "127.0.0.1:0".parse().unwrap(),
-            Arc::new(test_identity(Some(1500))),
-            live_limits.clone(),
-        )
-        .unwrap();
+        let address =
+            start_dist_control_listener("127.0.0.1:0".parse().unwrap(), live_limits.clone(), {
+                let live_limits = live_limits.clone();
+                Arc::new(move || test_builder_info(live_limits.get()))
+            })
+            .unwrap();
         assert_ne!(address.port(), 0);
 
         assert_eq!(
             super::client::request_dist_control(address, None, None).unwrap(),
-            builder_info(&test_identity(Some(1500)), cpu_model(), limits(4, None))
+            test_builder_info(limits(4, None))
         );
         assert_eq!(
             super::client::request_dist_control(address, Some(0), None).unwrap(),
-            builder_info(&test_identity(Some(1500)), cpu_model(), limits(0, None))
+            test_builder_info(limits(0, None))
         );
         assert_eq!(
             super::client::request_dist_control(address, None, Some(Some(1 << 30))).unwrap(),
-            builder_info(
-                &test_identity(Some(1500)),
-                cpu_model(),
-                limits(0, Some(1 << 30))
-            )
+            test_builder_info(limits(0, Some(1 << 30)))
         );
         assert_eq!(
             super::client::request_dist_control(address, Some(2), Some(Some(1 << 20))).unwrap(),
-            builder_info(
-                &test_identity(Some(1500)),
-                cpu_model(),
-                limits(2, Some(1 << 20))
-            )
+            test_builder_info(limits(2, Some(1 << 20)))
         );
         assert_eq!(live_limits.get(), limits(2, Some(1 << 20)));
         assert_eq!(
             super::client::request_dist_control(address, None, Some(None)).unwrap(),
-            builder_info(&test_identity(Some(1500)), cpu_model(), limits(2, None))
+            test_builder_info(limits(2, None))
         );
         assert_eq!(live_limits.get(), limits(2, None));
 
@@ -1605,7 +1671,7 @@ CPU revision\t: 1
     #[cfg(test)]
     #[derive(Default)]
     struct RecordingScheduler {
-        allocations: Mutex<Vec<(dist::CommandHash, String)>>,
+        allocations: Mutex<Vec<dist::CommandHash>>,
         state_updates: Mutex<Vec<(JobId, ServerId, JobState)>>,
         completions: Mutex<Vec<(JobId, ServerId, Option<u64>)>>,
     }
@@ -1617,12 +1683,8 @@ CPU revision\t: 1
             _requester: &dyn dist::SchedulerOutgoing,
             _toolchain: Toolchain,
             command_hash: dist::CommandHash,
-            client_name: String,
         ) -> Result<AllocJobResult> {
-            self.allocations
-                .lock()
-                .unwrap()
-                .push((command_hash, client_name));
+            self.allocations.lock().unwrap().push(command_hash);
             Ok(AllocJobResult::Fail {
                 msg: "recorded".to_owned(),
             })
@@ -1726,13 +1788,12 @@ CPU revision\t: 1
     }
 
     #[test]
-    fn scheduler_allocation_with_command_hash_and_client_name() {
+    fn scheduler_allocation_with_command_hash() {
         let router = recording_router();
         let client: SocketAddr = "192.0.2.7:40000".parse().unwrap();
         let body = bincode::serialize(&AllocJobHttpRequest {
             toolchain: test_toolchain(),
             command_hash: test_command_hash(),
-            client_name: "workstation-1".to_owned(),
         })
         .unwrap();
         let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
@@ -1743,10 +1804,10 @@ CPU revision\t: 1
         assert!(matches!(response, AllocJobHttpResponse::Fail { .. }));
         assert_eq!(
             *router.handler.allocations.lock().unwrap(),
-            vec![(test_command_hash(), "workstation-1".to_owned())]
+            vec![test_command_hash()]
         );
 
-        // The request body before the command hash and client name were added
+        // The request body before the command hash was added
         let body = bincode::serialize(&test_toolchain()).unwrap();
         let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
         assert_eq!(router.respond(1, &request).status_code, 400);
@@ -1830,6 +1891,7 @@ CPU revision\t: 1
             client: new_reqwest_blocking_client().unwrap(),
             scheduler_url,
             scheduler_auth: TEST_SERVER_TOKEN.to_owned(),
+            limits: Arc::new(LiveLimits::new(limits(1, None))),
         };
         use dist::ServerOutgoing;
         requester
@@ -1865,7 +1927,6 @@ CPU revision\t: 1
             &[],
             "client token".to_owned(),
             false,
-            "workstation-1".to_owned(),
         )
         .unwrap();
         let result = runtime
@@ -1874,7 +1935,7 @@ CPU revision\t: 1
         assert!(matches!(result, AllocJobResult::Fail { .. }));
         assert_eq!(
             *router.handler.allocations.lock().unwrap(),
-            vec![(test_command_hash(), "workstation-1".to_owned())]
+            vec![test_command_hash()]
         );
     }
 
@@ -1882,6 +1943,7 @@ CPU revision\t: 1
         client: reqwest::blocking::Client,
         scheduler_url: reqwest::Url,
         scheduler_auth: String,
+        limits: Arc<LiveLimits>,
     }
 
     impl dist::ServerOutgoing for ServerRequester {
@@ -1905,13 +1967,15 @@ CPU revision\t: 1
             peak_memory: Option<u64>,
         ) -> Result<UpdateJobStateResult> {
             let url = urls::scheduler_complete_job(&self.scheduler_url, job_id);
-            bincode_req(
+            let result = bincode_req(
                 self.client
                     .post(url)
                     .bearer_auth(self.scheduler_auth.clone())
                     .bincode(&CompleteJobHttpRequest { peak_memory })?,
             )
-            .context("POST to scheduler job_complete failed")
+            .context("POST to scheduler job_complete failed");
+            self.limits.request_heartbeat();
+            result
         }
     }
 }
@@ -2000,7 +2064,6 @@ mod client {
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
-        name: String,
     }
 
     impl Client {
@@ -2013,7 +2076,6 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
-            name: String,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
@@ -2036,7 +2098,6 @@ mod client {
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
-                name,
             })
         }
 
@@ -2087,7 +2148,6 @@ mod client {
                 .bincode(&AllocJobHttpRequest {
                     toolchain: tc,
                     command_hash,
-                    client_name: self.name.clone(),
                 })?;
 
             let client = self.client.clone();

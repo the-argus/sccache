@@ -786,7 +786,6 @@ pub struct DistConfig {
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
     pub dist_control_address: std::net::SocketAddr,
-    pub name: Option<String>, // defaults to hostname
 }
 
 impl Default for DistConfig {
@@ -799,7 +798,6 @@ impl Default for DistConfig {
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
             dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
-            name: None,
         }
     }
 }
@@ -1592,6 +1590,10 @@ pub mod scheduler {
         100_000
     }
 
+    pub fn default_assumed_worst_case_memory_usage() -> u64 {
+        8 * 1024 * 1024 * 1024
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
@@ -1602,6 +1604,11 @@ pub mod scheduler {
         pub memory_history_path: PathBuf,
         #[serde(default = "default_memory_history_max_entries")]
         pub memory_history_max_entries: usize,
+        #[serde(
+            default = "default_assumed_worst_case_memory_usage",
+            deserialize_with = "super::deserialize_size_from_str"
+        )]
+        pub assumed_worst_case_memory_usage: u64,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -1634,24 +1641,6 @@ pub mod server {
 
     fn default_dist_control_address() -> SocketAddr {
         super::DEFAULT_DIST_CONTROL_ADDRESS
-    }
-
-    pub fn default_max_memory() -> Option<u64> {
-        if cfg!(target_os = "linux") {
-            let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-            parse_available_memory(&meminfo)
-        } else {
-            None
-        }
-    }
-
-    // get MemAvailable from /proc/meminfo in bytes.
-    pub fn parse_available_memory(meminfo: &str) -> Option<u64> {
-        let line = meminfo
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
-        let kibibytes = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
-        kibibytes.checked_mul(1024)
     }
 
     // this one accepts a missing value and considers it to be a disabled memory limit
@@ -1741,10 +1730,7 @@ pub mod server {
         pub name: Option<String>,
         #[serde(default = "default_max_jobs")]
         pub max_jobs: usize,
-        #[serde(
-            default = "default_max_memory",
-            deserialize_with = "deserialize_optional_size"
-        )]
+        #[serde(default, deserialize_with = "deserialize_optional_size")]
         pub max_memory: Option<u64>,
         #[serde(default = "default_dist_control_address")]
         pub dist_control_address: SocketAddr,
@@ -2943,8 +2929,6 @@ toolchain_cache_size = 5368709120
 cache_dir = "/home/user/.cache/sccache-dist-client"
 # local endpoint for the CLI to communicate with a locally running server
 dist_control_address = "127.0.0.1:20502"
-# the name of this machine as a client of the scheduler
-name = "workstation-1"
 
 [dist.auth]
 type = "token"
@@ -3129,7 +3113,6 @@ key_prefix = "cosprefix"
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
                 dist_control_address: "127.0.0.1:20502".parse().unwrap(),
-                name: Some("workstation-1".to_owned()),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3265,11 +3248,7 @@ fn server_toml_parse_max_memory() {
     );
     assert_eq!(parse(r#"max_memory = "512M""#), Some(512 * 1024 * 1024));
     assert_eq!(parse("max_memory = 1073741824"), Some(1024 * 1024 * 1024));
-    if cfg!(target_os = "linux") {
-        assert!(parse("").is_some_and(|max_memory| max_memory > 0));
-    } else {
-        assert_eq!(parse(""), None);
-    }
+    assert_eq!(parse(""), None);
     assert!(
         toml::from_str::<server::Config>(&format!("max_memory = \"lots\"\n{CONFIG_STR}")).is_err()
     );
@@ -3287,31 +3266,6 @@ fn server_toml_parse_max_memory() {
     )
     .unwrap();
     assert_eq!(server_config.max_memory, None);
-}
-
-#[test]
-#[cfg(feature = "dist-server")]
-fn parse_available_memory_from_meminfo() {
-    const MEMINFO: &str = "\
-MemTotal:       65536000 kB
-MemFree:         1234567 kB
-MemAvailable:   40000000 kB
-";
-    assert_eq!(
-        server::parse_available_memory(MEMINFO),
-        Some(40000000 * 1024)
-    );
-    assert_eq!(server::parse_available_memory("MemFree: 1 kB\n"), None);
-    assert_eq!(
-        server::parse_available_memory("MemAvailable: many kB\n"),
-        None
-    );
-
-    assert_eq!(server::parse_available_memory("MemAvailable: 1024\n"), None);
-    assert_eq!(
-        server::parse_available_memory("MemFree:  1 kB\nMemAvailable:\t 2 kB\n"),
-        Some(2048)
-    );
 }
 
 #[test]
@@ -3345,6 +3299,44 @@ fn scheduler_toml_parse_memory_history() {
         PathBuf::from("/var/lib/sccache/history.json")
     );
     assert_eq!(scheduler_config.memory_history_max_entries, 10);
+}
+
+#[test]
+#[cfg(feature = "dist-server")]
+fn scheduler_toml_parse_assumed_worst_case_memory_usage() {
+    const CONFIG_STR: &str = r#"
+    public_addr = "127.0.0.1:10600"
+
+    [client_auth]
+    type = "DANGEROUSLY_INSECURE"
+
+    [server_auth]
+    type = "DANGEROUSLY_INSECURE"
+    "#;
+    let parse = |line: &str| -> u64 {
+        let scheduler_config: scheduler::Config =
+            toml::from_str(&format!("{line}\n{CONFIG_STR}")).unwrap();
+        scheduler_config.assumed_worst_case_memory_usage
+    };
+    assert_eq!(parse(""), 8 * 1024 * 1024 * 1024);
+    assert_eq!(
+        parse(r#"assumed_worst_case_memory_usage = "16G""#),
+        16 * 1024 * 1024 * 1024
+    );
+    assert_eq!(
+        parse(r#"assumed_worst_case_memory_usage = "512M""#),
+        512 * 1024 * 1024
+    );
+    assert_eq!(
+        parse("assumed_worst_case_memory_usage = 1048576"),
+        1024 * 1024
+    );
+    assert!(
+        toml::from_str::<scheduler::Config>(&format!(
+            "assumed_worst_case_memory_usage = \"lots\"\n{CONFIG_STR}"
+        ))
+        .is_err()
+    );
 }
 
 #[test]

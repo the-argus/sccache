@@ -3,20 +3,23 @@ use fs_err as fs;
 use sccache::dist::CommandHash;
 use sccache::lru_disk_cache::lru_cache::LruCache;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-pub const DEFAULT_PEAK_MEMORY_ESTIMATE: u64 = 1024 * 1024 * 1024;
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+const RECENT_COMPLETION_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Used to predict how much memory a new job will take, based on its command
 pub struct MemoryMeasurements {
-    last_peak_by_command: LruCache<CommandHash, u64>,
-    last_peak_by_client: HashMap<String, u64>,
+    last_peak_by_command: LruCache<CommandHash, Measurement>,
+}
+
+struct Measurement {
+    peak_memory: u64,
+    completed_at: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +27,8 @@ pub struct MemoryMeasurements {
 pub struct HistoryEntry {
     pub command_hash: CommandHash,
     pub peak_memory: u64,
+    #[serde(skip)] // only for jobs that are completed during this run of the scheduler
+    pub completed_at: Option<Instant>,
 }
 
 impl MemoryMeasurements {
@@ -39,37 +44,58 @@ impl MemoryMeasurements {
         for HistoryEntry {
             command_hash,
             peak_memory,
+            completed_at,
         } in entries_least_recently_used_first
         {
-            last_peak_by_command.insert(command_hash, peak_memory);
+            last_peak_by_command.insert(
+                command_hash,
+                Measurement {
+                    peak_memory,
+                    completed_at,
+                },
+            );
         }
         Self {
             last_peak_by_command,
-            last_peak_by_client: HashMap::new(),
         }
     }
 
-    pub fn estimate(&self, command_hash: &CommandHash, client_name: &str) -> u64 {
-        if let Some(&peak_memory) = self.last_peak_by_command.peek(command_hash) {
-            return peak_memory;
-        }
-        if let Some(&peak_memory) = self.last_peak_by_client.get(client_name) {
-            return peak_memory;
-        }
-        DEFAULT_PEAK_MEMORY_ESTIMATE
+    pub fn estimate(&self, command_hash: &CommandHash, worst_case: u64) -> u64 {
+        self.last_peak_by_command
+            .peek(command_hash)
+            .map_or(worst_case, |measurement| measurement.peak_memory)
     }
 
-    pub fn record(&mut self, command_hash: CommandHash, client_name: String, peak_memory: u64) {
-        self.last_peak_by_command.insert(command_hash, peak_memory);
-        self.last_peak_by_client.insert(client_name, peak_memory);
+    pub fn record(&mut self, command_hash: CommandHash, peak_memory: u64, completed_at: Instant) {
+        self.last_peak_by_command.insert(
+            command_hash,
+            Measurement {
+                peak_memory,
+                completed_at: Some(completed_at),
+            },
+        );
+    }
+
+    pub fn largest_recent_memory_peak(&self, now: Instant) -> u64 {
+        self.last_peak_by_command
+            .iter()
+            .filter(|(_, measurement)| {
+                measurement.completed_at.is_some_and(|completed_at| {
+                    now.saturating_duration_since(completed_at) <= RECENT_COMPLETION_WINDOW
+                })
+            })
+            .map(|(_, measurement)| measurement.peak_memory)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn history(&self) -> Vec<HistoryEntry> {
         self.last_peak_by_command
             .iter()
-            .map(|(command_hash, &peak_memory)| HistoryEntry {
+            .map(|(command_hash, measurement)| HistoryEntry {
                 command_hash: command_hash.clone(),
-                peak_memory,
+                peak_memory: measurement.peak_memory,
+                completed_at: measurement.completed_at,
             })
             .collect()
     }
@@ -161,63 +187,135 @@ mod tests {
         serde_json::from_value(serde_json::Value::String(format!("{number:064x}"))).unwrap()
     }
 
-    fn client(number: u8) -> String {
-        format!("client-{number}")
-    }
+    const WORST_CASE: u64 = 8000;
 
     fn entry(number: u8, peak_memory: u64) -> HistoryEntry {
         HistoryEntry {
             command_hash: command_hash(number),
             peak_memory,
+            completed_at: None,
+        }
+    }
+
+    fn make_history_entry(number: u8, peak_memory: u64, completed_at: Instant) -> HistoryEntry {
+        HistoryEntry {
+            completed_at: Some(completed_at),
+            ..entry(number, peak_memory)
         }
     }
 
     #[test]
-    fn estimate_fallback() {
+    fn unknown_command_is_assumed_worst_case() {
         let mut measurements = MemoryMeasurements::new(10);
+        let now = Instant::now();
         assert_eq!(
-            measurements.estimate(&command_hash(1), &client(1)),
-            DEFAULT_PEAK_MEMORY_ESTIMATE
+            measurements.estimate(&command_hash(1), WORST_CASE),
+            WORST_CASE
         );
 
-        measurements.record(command_hash(1), client(1), 100);
-        assert_eq!(measurements.estimate(&command_hash(1), &client(1)), 100);
-        // Same command from another client
-        assert_eq!(measurements.estimate(&command_hash(1), &client(2)), 100);
-        // Another command from the same client
-        assert_eq!(measurements.estimate(&command_hash(2), &client(1)), 100);
+        measurements.record(command_hash(1), 100, now);
+        assert_eq!(measurements.estimate(&command_hash(1), WORST_CASE), 100);
         assert_eq!(
-            measurements.estimate(&command_hash(2), &client(2)),
-            DEFAULT_PEAK_MEMORY_ESTIMATE
+            measurements.estimate(&command_hash(2), WORST_CASE),
+            WORST_CASE
+        );
+        assert_eq!(measurements.estimate(&command_hash(2), 50), 50);
+
+        measurements.record(command_hash(1), 150, now);
+        assert_eq!(measurements.estimate(&command_hash(1), WORST_CASE), 150);
+    }
+
+    #[test]
+    fn test_largest_recent_memory_peak() {
+        let mut measurements = MemoryMeasurements::new(10);
+        let start = Instant::now();
+        let after = |duration: Duration| start + duration;
+        assert_eq!(measurements.largest_recent_memory_peak(start), 0);
+
+        measurements.record(command_hash(1), 300, start);
+        measurements.record(command_hash(2), 200, after(Duration::from_secs(60)));
+        assert_eq!(
+            measurements.largest_recent_memory_peak(after(Duration::from_secs(60))),
+            300
+        );
+        assert_eq!(
+            measurements.largest_recent_memory_peak(after(RECENT_COMPLETION_WINDOW)),
+            300
+        );
+        assert_eq!(
+            measurements.largest_recent_memory_peak(after(
+                RECENT_COMPLETION_WINDOW + Duration::from_secs(1)
+            )),
+            200
+        );
+        assert_eq!(
+            measurements.largest_recent_memory_peak(after(
+                RECENT_COMPLETION_WINDOW + Duration::from_secs(61)
+            )),
+            0
         );
 
-        measurements.record(command_hash(3), client(1), 300);
-        assert_eq!(measurements.estimate(&command_hash(1), &client(1)), 100);
-        assert_eq!(measurements.estimate(&command_hash(2), &client(1)), 300);
+        // if the same command uses a different amount of memory on another run, it modifies the
+        // peak recorded for it
+        measurements.record(command_hash(1), 100, after(Duration::from_secs(120)));
+        assert_eq!(
+            measurements.largest_recent_memory_peak(after(Duration::from_secs(120))),
+            200
+        );
+        assert_eq!(
+            measurements.largest_recent_memory_peak(after(
+                RECENT_COMPLETION_WINDOW + Duration::from_secs(61)
+            )),
+            100
+        );
+    }
 
-        measurements.record(command_hash(1), client(2), 150);
-        assert_eq!(measurements.estimate(&command_hash(1), &client(1)), 150);
-        assert_eq!(measurements.estimate(&command_hash(2), &client(2)), 150);
+    #[test]
+    fn loaded_history_not_considered_in_recent_peaks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.json");
+        let mut measurements = MemoryMeasurements::new(10);
+        let now = Instant::now();
+        measurements.record(command_hash(1), 100, now);
+        save_history(&path, &measurements.history()).unwrap();
+
+        let loaded = load_history(&path, 10);
+        assert_eq!(loaded.history(), vec![entry(1, 100)]);
+        assert_eq!(loaded.estimate(&command_hash(1), WORST_CASE), 100);
+        assert_eq!(loaded.largest_recent_memory_peak(now), 0);
     }
 
     #[test]
     fn history_prefers_more_recent_entries() {
         let mut measurements = MemoryMeasurements::new(2);
-        measurements.record(command_hash(1), client(1), 100);
-        measurements.record(command_hash(2), client(1), 200);
+        let now = Instant::now();
+        measurements.record(command_hash(1), 100, now);
+        measurements.record(command_hash(2), 200, now);
         // Estimating does not update usage time
-        assert_eq!(measurements.estimate(&command_hash(1), &client(9)), 100);
-        measurements.record(command_hash(3), client(1), 300);
+        assert_eq!(measurements.estimate(&command_hash(1), WORST_CASE), 100);
+        measurements.record(command_hash(3), 300, now);
 
-        assert_eq!(measurements.history(), vec![entry(2, 200), entry(3, 300)]);
         assert_eq!(
-            measurements.estimate(&command_hash(1), &client(9)),
-            DEFAULT_PEAK_MEMORY_ESTIMATE
+            measurements.history(),
+            vec![
+                make_history_entry(2, 200, now),
+                make_history_entry(3, 300, now)
+            ]
+        );
+        assert_eq!(
+            measurements.estimate(&command_hash(1), WORST_CASE),
+            WORST_CASE
         );
 
         // Recording a known command again replaces the old recorded value
-        measurements.record(command_hash(2), client(1), 210);
-        assert_eq!(measurements.history(), vec![entry(3, 300), entry(2, 210)]);
+        measurements.record(command_hash(2), 210, now);
+        assert_eq!(
+            measurements.history(),
+            vec![
+                make_history_entry(3, 300, now),
+                make_history_entry(2, 210, now)
+            ]
+        );
     }
 
     #[test]
@@ -235,14 +333,11 @@ mod tests {
         assert_eq!(truncated.history(), vec![entry(2, 200), entry(3, 300)]);
 
         let mut measurements = MemoryMeasurements::new(10);
-        measurements.record(command_hash(4), client(1), 400);
+        measurements.record(command_hash(4), 400, Instant::now());
         save_history(&path, &measurements.history()).unwrap();
         let reloaded = load_history(&path, 10);
         assert_eq!(reloaded.history(), vec![entry(4, 400)]);
-        assert_eq!(
-            reloaded.estimate(&command_hash(9), &client(1)),
-            DEFAULT_PEAK_MEMORY_ESTIMATE
-        );
+        assert_eq!(reloaded.estimate(&command_hash(9), WORST_CASE), WORST_CASE);
     }
 
     #[test]
@@ -275,7 +370,7 @@ mod tests {
     fn failed_save_followed_by_successful_save() {
         let directory = tempfile::tempdir().unwrap();
         let mut measurements = MemoryMeasurements::new(10);
-        measurements.record(command_hash(1), client(1), 100);
+        measurements.record(command_hash(1), 100, Instant::now());
         let measurements = Mutex::new(measurements);
 
         // A file where the directory of the history should be

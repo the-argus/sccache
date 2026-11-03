@@ -17,8 +17,8 @@ use flate2::read::GzDecoder;
 use fs_err as fs;
 use libmount::Overlay;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
-    Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, JobId, OutputData, ProcessOutput,
+    TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
@@ -284,6 +284,8 @@ impl OverlayBuilder {
         inputs_rdr: InputsReader,
         output_paths: Vec<String>,
         overlay: &OverlaySpec,
+        job_id: JobId,
+        shared_job_processes: &Mutex<HashMap<JobId, u32>>,
     ) -> Result<BuildResult> {
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
@@ -411,8 +413,12 @@ impl OverlayBuilder {
                     cmd.arg(executable);
                     cmd.args(arguments);
                     let (compile_output, peak_memory) =
-                        crate::peak_memory::output_with_peak_memory(&mut cmd)
-                            .context("Failed to retrieve output from compile")?;
+                        crate::peak_memory::output_with_peak_memory(
+                            &mut cmd,
+                            job_id,
+                            shared_job_processes,
+                        )
+                        .context("Failed to retrieve output from compile")?;
                     trace!("compile_output: {:?}", compile_output);
                     trace!("peak_memory: {:?}", peak_memory);
 
@@ -483,13 +489,23 @@ impl BuilderIncoming for OverlayBuilder {
         outputs: Vec<String>,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
+        job_id: JobId,
+        shared_job_processes: &Mutex<HashMap<JobId, u32>>,
     ) -> Result<BuildResult> {
         debug!("Preparing overlay");
         let overlay = self
             .prepare_overlay_dirs(&tc, tccache)
             .context("failed to prepare overlay dirs")?;
         debug!("Performing build in {:?}", overlay);
-        let res = Self::perform_build(&self.bubblewrap, command, inputs_rdr, outputs, &overlay);
+        let res = Self::perform_build(
+            &self.bubblewrap,
+            command,
+            inputs_rdr,
+            outputs,
+            &overlay,
+            job_id,
+            shared_job_processes,
+        );
         debug!("Finishing with overlay");
         self.finish_overlay(&tc, overlay);
         debug!("Returning result");
@@ -899,6 +915,8 @@ impl BuilderIncoming for DockerBuilder {
         outputs: Vec<String>,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
+        _job_id: JobId,
+        _shared_job_processes: &Mutex<HashMap<JobId, u32>>,
     ) -> Result<BuildResult> {
         debug!("Finding container");
         let cid = self

@@ -303,6 +303,9 @@ public_addr = "127.0.0.1:10600"
 # max commands to remember in the memory usage history file. default is 100,000
 # which translates to about a 1MB file
 #memory_history_max_entries = 100000
+# amount of memory that sccache assumes a compilation will take if it's never
+# seen it before
+#assumed_worst_case_memory_usage = "8G"
 
 [client_auth]
 type = "token"
@@ -380,9 +383,9 @@ scheduler_url = "https://192.168.1.1"
 #name = "builder-1"
 # max jobs that can be assigned, default is cores + 1 + cores / 8
 #max_jobs = 17
-# total memory usage that is allowed for all sccache jobs to be using.
-# valid units are K/M/G/T. default value is the memory available (MemAvailable
-# in /proc/meminfo) when the build server starts. Linux only, otherwise unlimited
+# total estimated memory usage that is allowed for all sccache jobs to be
+# using. This check is in addition to the check against the available memory.
+# default is no limit
 #max_memory = "64G"
 # local address that is used for sccache CLI to communicate with a locally
 # running build server
@@ -468,9 +471,10 @@ To set max jobs or max memory, use the `sccache` CLI (`dist-client` feature
 must have been enabled during build):
 
 ```
-# print name, number of CPUs, CPU model, configured cpu_speed, and limits
-# according to the local build server, for example:
-# {"name":"builder-1","num_cpus":16,"cpu_model":"AMD Ryzen 9 5950X 16-Core Processor","configured_cpu_speed":null,"limits":{"max_jobs":19,"max_memory":68719476736}}
+# print name, number of CPUs, CPU model, configured cpu_speed, limits, available
+# memory and the memory of running jobs according to the local build server,
+# for example:
+# {"name":"builder-1","num_cpus":16,"cpu_model":"AMD Ryzen 9 5950X 16-Core Processor","configured_cpu_speed":null,"limits":{"max_jobs":19,"max_memory":68719476736},"available_memory":53687091200,"running_jobs_memory":[{"job_id":42,"current":524288000,"peak":734003200}]}
 sccache --dist-builder-info
 # set the number of max jobs to 4 and then also print stats afterwards like
 # --dist-builder-info does
@@ -513,25 +517,33 @@ all builders.
 #### Memory limits
 
 The scheduler estimates the peak memory of every job and only assigns a job to
-a builder if the estimates of the jobs already assigned to it, plus the
-estimate of the new job, are at most the builder's `max_memory`. This is in
-addition to the `max_jobs` limit. The memory values are not enforced, however,
-so if a job uses much more than expected it can still cause OOM and it won't be
-killed. It's advisable to use something like cgroup memory limits or earlyoom
-to get better guarantees.
+a builder if it is estimated to be less than the builder's available memory.
+This is in addition to the `max_jobs` limit. The memory values are not
+enforced, however, so if a job uses much more than expected it can still cause
+OOM and it won't be killed. It's advisable to use something like cgroup memory
+limits or earlyoom to get better guarantees.
 
 Memory usage is estimated as follows:
 
 1. the peak memory last measured for the same compile command
-2. otherwise assume it will be the same as the peak memory of the most recently
-   completed job requested by the same client machine (note that this working
-   properly requires clients to have different hostnames or else configure
-   different `name` values in their client config)
-3. else: 1GB
+2. otherwise the worst case, which is the largest of
+   - `assumed_worst_case_memory_usage` from the scheduler config (default 8GB)
+   - the peak memory so far of any job that is currently running
+   - the peak memory of any job that completed in the last 10 minutes
+
+`max_memory` is the config option which limits the sum of the estimates of the
+jobs assigned to a builder. It is unlimited by default.
+
+Note also that a build server which doesn't report its available memory (maybe
+it doesn't have sufficient permissions or is running in docker rather than
+overlay mode, something) will not have memory usage constrained.
+
+TODO: try to still constrain memory usage by max_memory at least, resolve the
+above point with the one below.
 
 When using sccache dist with Docker or Pot, measuring memory usage is not
-supported, so it is assumed every job takes 1GB, which may still lead to system
-OOM for very memory hungry builds.
+supported, so the worst case memory usage is assumed for every job, which may
+still lead to system OOM for very memory hungry builds.
 
 The scheduler exposes a config option `memory_history_path` for where to save
 memory usage history, and `memory_history_max_entries` to limit the max size

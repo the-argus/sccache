@@ -193,7 +193,6 @@ pub fn sccache_client_cfg(
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
             dist_control_address: sccache::config::DEFAULT_DIST_CONTROL_ADDRESS,
-            name: None,
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
@@ -213,6 +212,9 @@ fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
             .join("scheduler-memory-history.json"),
         memory_history_max_entries: sccache::config::scheduler::default_memory_history_max_entries(
         ),
+        // generally use low numbers so that memavailable of machine (probably) doesn't come into
+        // play. TODO: get memavailable and assert this somewhere
+        assumed_worst_case_memory_usage: 1024 * 1024 * 1024,
     }
 }
 
@@ -241,7 +243,7 @@ fn sccache_server_cfg(
         toolchain_cache_size: TC_CACHE_SIZE,
         name: None,
         max_jobs: sccache::config::server::default_max_jobs(),
-        max_memory: sccache::config::server::default_max_memory(),
+        max_memory: None,
         dist_control_address,
         cpu_speed: std::num::NonZeroU32::new(DIST_SERVER_CPU_SPEED),
     }
@@ -518,7 +520,7 @@ impl DistSystem {
                 configured_cpu_speed: Some(DIST_SERVER_CPU_SPEED),
             },
             sccache::config::server::default_max_jobs(),
-            sccache::config::server::default_max_memory(),
+            None,
             dist_control_address,
             handler,
         )

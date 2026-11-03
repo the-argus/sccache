@@ -15,8 +15,8 @@
 use anyhow::{Context, Error, Result, bail};
 use flate2::read::GzDecoder;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
-    Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, JobId, OutputData, ProcessOutput,
+    TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
@@ -407,6 +407,8 @@ impl BuilderIncoming for PotBuilder {
         outputs: Vec<String>,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
+        _job_id: JobId,
+        _shared_job_processes: &Mutex<HashMap<JobId, u32>>,
     ) -> Result<BuildResult> {
         debug!("Finding container");
         let cid = self
