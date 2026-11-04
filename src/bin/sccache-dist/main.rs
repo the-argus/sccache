@@ -569,6 +569,7 @@ fn could_job_ever_run_on_server(
     worst_case: u64,
     estimate: u64,
 ) -> bool {
+    let accepts_jobs = info.limits.max_jobs > 0;
     let within_max_memory = info
         .limits
         .max_memory
@@ -582,7 +583,7 @@ fn could_job_ever_run_on_server(
         estimate,
     )
     .is_none_or(|JobServerMemoryStats { available, .. }| estimate <= available);
-    within_max_memory && within_available_memory
+    accepts_jobs && within_max_memory && within_available_memory
 }
 
 // ranking for the relative performance of a build server.
@@ -1301,6 +1302,36 @@ mod scheduler_tests {
         .unwrap();
 
         assert_eq!(allocate(&scheduler), None);
+    }
+
+    #[test]
+    fn job_allocation_fails_if_all_servers_have_zero_max_jobs() {
+        let scheduler = Scheduler::default();
+        let disabled_server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            disabled_server_id,
+            &ServerNonce::new(),
+            builder_info("a", 4, 0),
+        )
+        .unwrap();
+        let message = expect_failure(allocate_command(&scheduler, command_hash(0)));
+        assert!(
+            message.contains("none of the 1 servers accepts jobs"),
+            "{message}"
+        );
+
+        let full_server_id: ServerId = "127.0.0.2:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            full_server_id,
+            &ServerNonce::new(),
+            builder_info("b", 4, 1),
+        )
+        .unwrap();
+        assert_eq!(allocate(&scheduler), Some(full_server_id));
+        let message = expect_failure(allocate_command(&scheduler, command_hash(0)));
+        assert!(message.contains("Insufficient capacity"), "{message}");
     }
 
     #[test]
@@ -2042,7 +2073,7 @@ mod scheduler_tests {
         .unwrap();
         let message = expect_failure(allocate_command(&scheduler, command_hash(1)));
         assert!(
-            message.contains("exceeds the max memory or available memory of all 1 servers"),
+            message.contains("none of the 1 servers accepts jobs"),
             "{message}"
         );
     }
@@ -2095,7 +2126,7 @@ mod scheduler_tests {
         .unwrap();
         let message = expect_failure(allocate_command(&scheduler, command_hash(1)));
         assert!(
-            message.contains("exceeds the max memory or available memory of all 1 servers"),
+            message.contains("none of the 1 servers accepts jobs"),
             "{message}"
         );
     }
