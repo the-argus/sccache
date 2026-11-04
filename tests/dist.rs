@@ -369,6 +369,54 @@ fn test_dist_max_jobs_via_dist_control() {
 
 #[test]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_jobs_appear_idling_until_capacity_is_available() {
+    let temporary_directory = tempfile::Builder::new()
+        .prefix("sccache_dist_test")
+        .tempdir()
+        .unwrap();
+    let temporary_directory = temporary_directory.path();
+    let sccache_dist = harness::sccache_dist_path();
+
+    let mut system = harness::DistSystem::new(&sccache_dist, temporary_directory);
+    system.add_scheduler();
+    let server_handle = system.add_server();
+
+    let mut sccache_config =
+        dist_test_sccache_client_cfg(temporary_directory, system.scheduler_url());
+    sccache_config.dist.dist_control_address = server_handle.dist_control_address();
+    let sccache_config_path = temporary_directory.join("sccache-cfg.json");
+    write_json_cfg(temporary_directory, "sccache-cfg.json", &sccache_config);
+    let sccache_cached_config_path = temporary_directory.join("sccache-cached-cfg");
+
+    stop_local_daemon();
+    start_local_daemon(&sccache_config_path, &sccache_cached_config_path);
+
+    set_builder_max_jobs(&sccache_config_path, 1, &[]);
+    system.wait_for_builder_limits(|limits| limits.max_jobs == 1);
+
+    const COMPILES: usize = 8;
+    std::thread::scope(|scope| {
+        for number in 0..COMPILES {
+            let (sccache_config_path, sccache_cached_config_path) =
+                (&sccache_config_path, &sccache_cached_config_path);
+            scope.spawn(move || {
+                compile_c_file(
+                    temporary_directory,
+                    sccache_config_path,
+                    sccache_cached_config_path,
+                    &format!("file{number}"),
+                );
+            });
+        }
+    });
+    get_stats(|info| {
+        assert_eq!(COMPILES, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+}
+
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_max_memory_via_dist_control() {
     let temporary_directory = tempfile::Builder::new()
         .prefix("sccache_dist_test")

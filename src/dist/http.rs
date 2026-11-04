@@ -110,6 +110,7 @@ mod common {
         Fail {
             msg: String,
         },
+        NoCapacity,
     }
     impl AllocJobHttpResponse {
         #[cfg(feature = "dist-server")]
@@ -138,6 +139,7 @@ mod common {
                     }
                 }
                 dist::AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
+                dist::AllocJobResult::NoCapacity => AllocJobHttpResponse::NoCapacity,
             }
         }
     }
@@ -759,10 +761,10 @@ mod server {
                 ))
             })?;
 
-            // This limit is rouille's default for `start_server_with_pool`, which
-            // we would use, except that interface doesn't permit any sort of
-            // error handling to be done.
-            let server = server.pool_size(num_cpus() * 8);
+            // another option here would be something like let server = server.pool_size(num_cpus()
+            // * 8); but we want to serve a lot of requests, since these can stay open for a long
+            // time while waiting for space to become available. The best option would be to migrate
+            // to async.
             server.run();
 
             panic!("Rouille server terminated")
@@ -1684,7 +1686,11 @@ MemAvailable:   40000000 kB
             _toolchain: Toolchain,
             command_hash: dist::CommandHash,
         ) -> Result<AllocJobResult> {
+            let no_capacity = command_hash == no_capacity_command_hash();
             self.allocations.lock().unwrap().push(command_hash);
+            if no_capacity {
+                return Ok(AllocJobResult::NoCapacity);
+            }
             Ok(AllocJobResult::Fail {
                 msg: "recorded".to_owned(),
             })
@@ -1778,6 +1784,11 @@ MemAvailable:   40000000 kB
     #[cfg(test)]
     fn test_command_hash() -> dist::CommandHash {
         serde_json::from_value(serde_json::Value::String(format!("{:064x}", 7))).unwrap()
+    }
+
+    #[cfg(test)]
+    fn no_capacity_command_hash() -> dist::CommandHash {
+        serde_json::from_value(serde_json::Value::String(format!("{:064x}", 8))).unwrap()
     }
 
     #[cfg(test)]
@@ -1933,9 +1944,13 @@ MemAvailable:   40000000 kB
             .block_on(client.do_alloc_job(test_toolchain(), test_command_hash()))
             .unwrap();
         assert!(matches!(result, AllocJobResult::Fail { .. }));
+        let result = runtime
+            .block_on(client.do_alloc_job(test_toolchain(), no_capacity_command_hash()))
+            .unwrap();
+        assert!(matches!(result, AllocJobResult::NoCapacity));
         assert_eq!(
             *router.handler.allocations.lock().unwrap(),
-            vec![test_command_hash()]
+            vec![test_command_hash(), no_capacity_command_hash()]
         );
     }
 
@@ -2201,6 +2216,7 @@ mod client {
                     alloc_job_res
                 }
                 AllocJobHttpResponse::Fail { msg } => Ok(AllocJobResult::Fail { msg }),
+                AllocJobHttpResponse::NoCapacity => Ok(AllocJobResult::NoCapacity),
             }
         }
 

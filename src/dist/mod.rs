@@ -566,6 +566,7 @@ pub enum AllocJobResult {
     Fail {
         msg: String,
     },
+    NoCapacity,
 }
 
 // AssignJob

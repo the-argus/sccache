@@ -556,6 +556,19 @@ again, so this job will continue to be compiled locally since any change to the
 expected amount of memory it uses is unknown. Unless the available memory of the
 builders increases.
 
+#### What happens when there is not enough capacity
+
+The scheduler will allow a job to wait for resources to become available,
+appearing to the client to just be compiling. Currently these connections are
+managed with OS threads. If many many jobs may be requested at once, it may be
+necessary to increase open file limits (`LimitNOFILE`) for the scheduler
+processes.
+
+This waiting will only happen if we expect the resources to become available
+due to other compilation jobs completing. If a job would not be able to run
+anywhere even after all other jobs completed, then it is considered failed and
+the requesting machine will be tasked with building it locally.
+
 # Building the Distributed Server Binaries
 
 Until these binaries [are included in releases](https://github.com/mozilla/sccache/issues/393) I've put together a Docker container that can be used to easily build a release binary:

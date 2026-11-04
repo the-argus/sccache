@@ -972,41 +972,50 @@ where
 
         let command_hash = dist::CommandHash::new(&dist_compile_cmd, &dist_toolchain)?;
         debug!("[{}]: Requesting allocation", out_pretty);
-        let jares = dist_client
-            .do_alloc_job(dist_toolchain.clone(), command_hash)
-            .await?;
-        let job_alloc = match jares {
-            dist::AllocJobResult::Success {
-                job_alloc,
-                need_toolchain: true,
-            } => {
-                debug!(
-                    "[{}]: Sending toolchain {} for job {}",
-                    out_pretty, dist_toolchain.archive_id, job_alloc.job_id
-                );
+        let job_alloc = loop {
+            break match dist_client
+                .do_alloc_job(dist_toolchain.clone(), command_hash.clone())
+                .await?
+            {
+                dist::AllocJobResult::Success {
+                    job_alloc,
+                    need_toolchain: true,
+                } => {
+                    debug!(
+                        "[{}]: Sending toolchain {} for job {}",
+                        out_pretty, dist_toolchain.archive_id, job_alloc.job_id
+                    );
 
-                match dist_client
-                    .do_submit_toolchain(job_alloc.clone(), dist_toolchain)
-                    .await
-                    .map_err(|e| e.context("Could not submit toolchain"))?
-                {
-                    dist::SubmitToolchainResult::Success => Ok(job_alloc),
-                    dist::SubmitToolchainResult::JobNotFound => {
-                        bail!("Job {} not found on server", job_alloc.job_id)
+                    match dist_client
+                        .do_submit_toolchain(job_alloc.clone(), dist_toolchain)
+                        .await
+                        .map_err(|e| e.context("Could not submit toolchain"))?
+                    {
+                        dist::SubmitToolchainResult::Success => Ok(job_alloc),
+                        dist::SubmitToolchainResult::JobNotFound => {
+                            bail!("Job {} not found on server", job_alloc.job_id)
+                        }
+                        dist::SubmitToolchainResult::CannotCache => bail!(
+                            "Toolchain for job {} could not be cached by server",
+                            job_alloc.job_id
+                        ),
                     }
-                    dist::SubmitToolchainResult::CannotCache => bail!(
-                        "Toolchain for job {} could not be cached by server",
-                        job_alloc.job_id
-                    ),
                 }
-            }
-            dist::AllocJobResult::Success {
-                job_alloc,
-                need_toolchain: false,
-            } => Ok(job_alloc),
-            dist::AllocJobResult::Fail { msg } => {
-                Err(anyhow!("Failed to allocate job").context(msg))
-            }
+                dist::AllocJobResult::Success {
+                    job_alloc,
+                    need_toolchain: false,
+                } => Ok(job_alloc),
+                dist::AllocJobResult::Fail { msg } => {
+                    Err(anyhow!("Failed to allocate job").context(msg))
+                }
+                dist::AllocJobResult::NoCapacity => {
+                    debug!(
+                        "[{}]: No capacity yet, requesting allocation again",
+                        out_pretty
+                    );
+                    continue;
+                }
+            };
         }?;
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
@@ -3122,10 +3131,14 @@ LLVM version: 6.0",
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
+    #[test_case(true, 0 ; "with preprocessor cache")]
+    #[test_case(false, 0 ; "without preprocessor cache")]
+    #[test_case(false, 2 ; "after the scheduler has no available resources")]
     #[cfg(feature = "dist-client")]
-    fn test_compiler_get_cached_or_compile_dist(preprocessor_cache_mode: bool) {
+    fn test_compiler_get_cached_or_compile_dist(
+        preprocessor_cache_mode: bool,
+        no_available_resources_replies: usize,
+    ) {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3174,7 +3187,8 @@ LLVM version: 6.0",
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
         // Dist client will do the compilation
-        let dist_client = test_dist::OneshotClient::new(
+        let dist_client = test_dist::OneshotClient::no_available_resources_replies(
+            no_available_resources_replies,
             0,
             COMPILER_STDOUT.to_owned(),
             COMPILER_STDERR.to_owned(),
@@ -3866,7 +3880,10 @@ mod test_dist {
     };
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    };
 
     use crate::errors::*;
 
@@ -4135,6 +4152,7 @@ mod test_dist {
 
     pub struct OneshotClient {
         has_started: AtomicBool,
+        num_no_available_resources_replies_remaining: AtomicUsize,
         tc: Toolchain,
         output: ProcessOutput,
     }
@@ -4142,8 +4160,20 @@ mod test_dist {
     impl OneshotClient {
         #[allow(clippy::new_ret_no_self)]
         pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
+            Self::no_available_resources_replies(0, code, stdout, stderr)
+        }
+
+        pub fn no_available_resources_replies(
+            num_no_available_resources_replies: usize,
+            code: i32,
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+        ) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
+                num_no_available_resources_replies_remaining: AtomicUsize::new(
+                    num_no_available_resources_replies,
+                ),
                 tc: Toolchain {
                     archive_id: "somearchiveid".to_owned(),
                 },
@@ -4159,6 +4189,17 @@ mod test_dist {
             tc: Toolchain,
             _: dist::CommandHash,
         ) -> Result<AllocJobResult> {
+            if self
+                .num_no_available_resources_replies_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Ok(AllocJobResult::NoCapacity);
+            }
             assert!(
                 !self
                     .has_started
