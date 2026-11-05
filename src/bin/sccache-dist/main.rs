@@ -11,9 +11,10 @@ use sccache::config::{
 use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuildResult, BuilderIncoming, BuilderInfo, CommandHash,
     CompileCommand, HeartbeatServerResult, InputsReader, JobAlloc, JobAuthorizer, JobComplete,
-    JobId, JobState, RunJobResult, RunningJobMemory, SchedulerIncoming, SchedulerOutgoing,
-    SchedulerStatusResult, ServerId, ServerIncoming, ServerNonce, ServerOutgoing, ServerStatus,
-    SubmitToolchainResult, TcCache, Toolchain, ToolchainReader, UpdateJobStateResult,
+    JobId, JobMemoryHints, JobState, RunJobResult, RunningJobMemory, SchedulerIncoming,
+    SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming, ServerNonce,
+    ServerOutgoing, ServerStatus, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
+    UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
@@ -177,7 +178,6 @@ fn run(command: Command) -> Result<i32> {
             server_auth,
             memory_history_path,
             memory_history_max_entries,
-            assumed_worst_case_memory_usage,
         }) => {
             let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
                 scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
@@ -233,7 +233,7 @@ fn run(command: Command) -> Result<i32> {
                 memory_history::load_history(&memory_history_path, memory_history_max_entries);
 
             daemonize(&[])?;
-            let scheduler = Scheduler::new(memory_measurements, assumed_worst_case_memory_usage);
+            let scheduler = Scheduler::new(memory_measurements);
             memory_history::start_saving_history(
                 scheduler.memory_measurements.clone(),
                 memory_history_path,
@@ -377,6 +377,7 @@ struct JobDetail {
     state: JobState,
     assigned_at: Instant,
     command_hash: CommandHash,
+    memory_hints: JobMemoryHints,
 }
 
 // To avoid deadlicking, make sure to do all locking at once (i.e. no further locking in a downward scope),
@@ -400,8 +401,6 @@ pub struct Scheduler {
     memory_measurements: Arc<Mutex<MemoryMeasurements>>,
 
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
-
-    assumed_worst_case_memory_usage: u64,
 }
 
 struct ServerDetails {
@@ -413,22 +412,11 @@ struct ServerDetails {
 }
 
 impl Scheduler {
-    pub fn new(
-        memory_measurements: MemoryMeasurements,
-        assumed_worst_case_memory_usage: u64,
-    ) -> Self {
-        Self::with_job_id_base(
-            OsRng.next_u64(),
-            memory_measurements,
-            assumed_worst_case_memory_usage,
-        )
+    pub fn new(memory_measurements: MemoryMeasurements) -> Self {
+        Self::with_job_id_base(OsRng.next_u64(), memory_measurements)
     }
 
-    fn with_job_id_base(
-        job_id_base: u64,
-        memory_measurements: MemoryMeasurements,
-        assumed_worst_case_memory_usage: u64,
-    ) -> Self {
+    fn with_job_id_base(job_id_base: u64, memory_measurements: MemoryMeasurements) -> Self {
         Scheduler {
             job_id_base,
             job_count: AtomicUsize::new(0),
@@ -438,7 +426,6 @@ impl Scheduler {
             waiting_allocations: AtomicUsize::new(0),
             memory_measurements: Arc::new(Mutex::new(memory_measurements)),
             servers: Mutex::new(HashMap::new()),
-            assumed_worst_case_memory_usage,
         }
     }
 
@@ -487,10 +474,9 @@ impl Scheduler {
 
 impl Default for Scheduler {
     fn default() -> Self {
-        Self::new(
-            MemoryMeasurements::new(scheduler_config::default_memory_history_max_entries()),
-            scheduler_config::default_assumed_worst_case_memory_usage(),
-        )
+        Self::new(MemoryMeasurements::new(
+            scheduler_config::default_memory_history_max_entries(),
+        ))
     }
 }
 
@@ -509,8 +495,7 @@ fn reported_memory(job_id: JobId, info: &BuilderInfo) -> Option<&RunningJobMemor
         .find(|job| job.job_id == job_id)
 }
 
-fn calculate_worst_case_memory_usage(
-    assumed_worst_case_memory_usage: u64,
+fn largest_recent_peak_memory(
     jobs: &BTreeMap<JobId, JobDetail>,
     memory_measurements: &MemoryMeasurements,
     servers: &HashMap<ServerId, ServerDetails>,
@@ -519,11 +504,23 @@ fn calculate_worst_case_memory_usage(
     jobs.iter()
         .filter_map(|(&job_id, job)| reported_memory(job_id, &servers.get(&job.server_id)?.info))
         .map(|job_memory_usage| job_memory_usage.peak)
-        .chain([
-            assumed_worst_case_memory_usage,
-            memory_measurements.largest_recent_memory_peak(now),
-        ])
+        .chain([memory_measurements.largest_recent_memory_peak(now)])
         .fold(0, u64::max)
+}
+
+fn estimate_job_memory(
+    command_hash: &CommandHash,
+    memory_hints: JobMemoryHints,
+    memory_measurements: &MemoryMeasurements,
+    largest_peak: u64,
+) -> u64 {
+    if !memory_hints.is_potentially_memory_intensive {
+        return 0;
+    }
+    let worst_case = memory_hints
+        .assumed_worst_case_memory_usage
+        .max(largest_peak);
+    memory_measurements.estimate(command_hash, worst_case)
 }
 
 // Note that for this function, the inputs include all jobs, so this estimate
@@ -533,10 +530,17 @@ fn estimate_memory_of_server_jobs(
     server_id: ServerId,
     jobs: &BTreeMap<JobId, JobDetail>,
     memory_measurements: &MemoryMeasurements,
-    worst_case: u64,
+    largest_peak: u64,
 ) -> u64 {
     get_server_jobs(server_id, jobs)
-        .map(|(_, job)| memory_measurements.estimate(&job.command_hash, worst_case))
+        .map(|(_, job)| {
+            estimate_job_memory(
+                &job.command_hash,
+                job.memory_hints,
+                memory_measurements,
+                largest_peak,
+            )
+        })
         .fold(0, u64::saturating_add)
 }
 
@@ -550,7 +554,7 @@ fn get_server_memory_stats(
     info: &BuilderInfo,
     jobs: &BTreeMap<JobId, JobDetail>,
     memory_measurements: &MemoryMeasurements,
-    worst_case: u64,
+    largest_peak: u64,
     new_job_estimate: u64,
 ) -> Option<JobServerMemoryStats> {
     let available_memory = info.available_memory?;
@@ -562,7 +566,12 @@ fn get_server_memory_stats(
         |sum, (&job_id, job)| {
             let (memory_current, memory_peak) = reported_memory(job_id, info)
                 .map_or((0, 0), |job_memory| (job_memory.current, job_memory.peak));
-            let estimate = memory_measurements.estimate(&job.command_hash, worst_case);
+            let estimate = estimate_job_memory(
+                &job.command_hash,
+                job.memory_hints,
+                memory_measurements,
+                largest_peak,
+            );
             JobServerMemoryStats {
                 needed: sum.needed.saturating_add(estimate.max(memory_peak)),
                 available: sum.available.saturating_add(memory_current),
@@ -577,7 +586,7 @@ fn could_job_ever_run_on_server(
     info: &BuilderInfo,
     jobs: &BTreeMap<JobId, JobDetail>,
     memory_measurements: &MemoryMeasurements,
-    worst_case: u64,
+    largest_peak: u64,
     estimate: u64,
 ) -> bool {
     let accepts_jobs = info.limits.max_jobs > 0;
@@ -590,7 +599,7 @@ fn could_job_ever_run_on_server(
         info,
         jobs,
         memory_measurements,
-        worst_case,
+        largest_peak,
         estimate,
     )
     .is_none_or(|JobServerMemoryStats { available, .. }| estimate <= available);
@@ -639,6 +648,7 @@ impl Scheduler {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
         command_hash: CommandHash,
+        memory_hints: JobMemoryHints,
         max_wait: Duration,
     ) -> Result<AllocJobResult> {
         let (job_id, server_id, auth) = {
@@ -653,14 +663,14 @@ impl Scheduler {
                 self.prune_servers(&mut servers, &mut jobs);
 
                 let now = Instant::now();
-                let worst_case = calculate_worst_case_memory_usage(
-                    self.assumed_worst_case_memory_usage,
-                    &jobs,
+                let largest_peak =
+                    largest_recent_peak_memory(&jobs, &memory_measurements, &servers, now);
+                let estimated_peak_memory = estimate_job_memory(
+                    &command_hash,
+                    memory_hints,
                     &memory_measurements,
-                    &servers,
-                    now,
+                    largest_peak,
                 );
-                let estimated_peak_memory = memory_measurements.estimate(&command_hash, worst_case);
                 let res = {
                     let mut best: Option<(ServerId, Ranking)> = None;
                     let mut best_err: Option<(ServerId, Instant)> = None;
@@ -670,32 +680,35 @@ impl Scheduler {
                         if num_jobs_assigned >= max_jobs {
                             continue;
                         }
-                        if let Some(max_memory) = details.info.limits.max_memory {
-                            let estimated_memory_of_assigned_jobs = estimate_memory_of_server_jobs(
+                        if memory_hints.is_potentially_memory_intensive {
+                            if let Some(max_memory) = details.info.limits.max_memory {
+                                let estimated_memory_of_assigned_jobs =
+                                    estimate_memory_of_server_jobs(
+                                        server_id,
+                                        &jobs,
+                                        &memory_measurements,
+                                        largest_peak,
+                                    );
+                                if estimated_memory_of_assigned_jobs
+                                    .saturating_add(estimated_peak_memory)
+                                    > max_memory
+                                {
+                                    continue;
+                                }
+                            }
+                            if get_server_memory_stats(
                                 server_id,
+                                &details.info,
                                 &jobs,
                                 &memory_measurements,
-                                worst_case,
-                            );
-                            if estimated_memory_of_assigned_jobs
-                                .saturating_add(estimated_peak_memory)
-                                > max_memory
-                            {
+                                largest_peak,
+                                estimated_peak_memory,
+                            )
+                            .is_some_and(
+                                |JobServerMemoryStats { needed, available }| needed > available,
+                            ) {
                                 continue;
                             }
-                        }
-                        if get_server_memory_stats(
-                            server_id,
-                            &details.info,
-                            &jobs,
-                            &memory_measurements,
-                            worst_case,
-                            estimated_peak_memory,
-                        )
-                        .is_some_and(
-                            |JobServerMemoryStats { needed, available }| needed > available,
-                        ) {
-                            continue;
                         }
 
                         if let Some(last_error) = details.last_error {
@@ -747,6 +760,7 @@ impl Scheduler {
                                     state: JobState::Pending,
                                     assigned_at: Instant::now(),
                                     command_hash: command_hash.clone(),
+                                    memory_hints,
                                 }
                             )
                             .is_none()
@@ -772,7 +786,7 @@ impl Scheduler {
                             &details.info,
                             &jobs,
                             &memory_measurements,
-                            worst_case,
+                            largest_peak,
                             estimated_peak_memory,
                         )
                     });
@@ -868,8 +882,15 @@ impl SchedulerIncoming for Scheduler {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
         command_hash: CommandHash,
+        memory_hints: JobMemoryHints,
     ) -> Result<AllocJobResult> {
-        self.alloc_job(requester, tc, command_hash, ALLOC_JOB_WAIT_TIMEOUT)
+        self.alloc_job(
+            requester,
+            tc,
+            command_hash,
+            memory_hints,
+            ALLOC_JOB_WAIT_TIMEOUT,
+        )
     }
 
     fn handle_heartbeat_server(
@@ -1201,14 +1222,14 @@ mod scheduler_tests {
 
     #[test]
     fn scheduler_instances_namespace_job_ids() {
-        let scheduler0 = Scheduler::with_job_id_base(0x1000, MemoryMeasurements::new(10), 0);
-        let scheduler1 = Scheduler::with_job_id_base(0x2000, MemoryMeasurements::new(10), 0);
+        let scheduler0 = Scheduler::with_job_id_base(0x1000, MemoryMeasurements::new(10));
+        let scheduler1 = Scheduler::with_job_id_base(0x2000, MemoryMeasurements::new(10));
 
         assert_eq!(scheduler0.next_job_id(), JobId(0x1000));
         assert_eq!(scheduler0.next_job_id(), JobId(0x1001));
         assert_eq!(scheduler1.next_job_id(), JobId(0x2000));
 
-        let wrapping = Scheduler::with_job_id_base(u64::MAX - 1, MemoryMeasurements::new(10), 0);
+        let wrapping = Scheduler::with_job_id_base(u64::MAX - 1, MemoryMeasurements::new(10));
         assert_eq!(wrapping.next_job_id(), JobId(u64::MAX - 1));
         assert_eq!(wrapping.next_job_id(), JobId(u64::MAX));
         assert_eq!(wrapping.next_job_id(), JobId(0));
@@ -1289,11 +1310,20 @@ mod scheduler_tests {
     }
 
     fn allocate_command(scheduler: &Scheduler, command_hash: CommandHash) -> AllocJobResult {
+        allocate_command_with_hints(scheduler, JobMemoryHints::default(), command_hash)
+    }
+
+    fn allocate_command_with_hints(
+        scheduler: &Scheduler,
+        memory_hints: JobMemoryHints,
+        command_hash: CommandHash,
+    ) -> AllocJobResult {
         scheduler
             .alloc_job(
                 &DummyAlwaysAcceptStrategy,
                 toolchain(),
                 command_hash,
+                memory_hints,
                 Duration::ZERO,
             )
             .unwrap()
@@ -1301,7 +1331,14 @@ mod scheduler_tests {
 
     // returns server that was given the job
     fn allocate(scheduler: &Scheduler) -> Option<ServerId> {
-        match allocate_command(scheduler, command_hash(0)) {
+        allocate_with_hints(scheduler, JobMemoryHints::default())
+    }
+
+    fn allocate_with_hints(
+        scheduler: &Scheduler,
+        memory_hints: JobMemoryHints,
+    ) -> Option<ServerId> {
+        match allocate_command_with_hints(scheduler, memory_hints, command_hash(0)) {
             AllocJobResult::Success { job_alloc, .. } => Some(job_alloc.server_id),
             AllocJobResult::Fail { .. } | AllocJobResult::NoCapacity => None,
         }
@@ -1704,7 +1741,13 @@ mod scheduler_tests {
             info: builder_info("a", 4, 0),
         };
         let allocation = scheduler
-            .alloc_job(&requester, toolchain(), command_hash(0), Duration::ZERO)
+            .alloc_job(
+                &requester,
+                toolchain(),
+                command_hash(0),
+                JobMemoryHints::default(),
+                Duration::ZERO,
+            )
             .unwrap();
         // seems fine
         assert!(matches!(allocation, AllocJobResult::Success { .. }));
@@ -1736,7 +1779,13 @@ mod scheduler_tests {
             info: builder_info("a", 4, 1),
         };
         let allocation = scheduler
-            .alloc_job(&requester, toolchain(), command_hash(0), Duration::ZERO)
+            .alloc_job(
+                &requester,
+                toolchain(),
+                command_hash(0),
+                JobMemoryHints::default(),
+                Duration::ZERO,
+            )
             .unwrap();
 
         // this should not work
@@ -1806,7 +1855,13 @@ mod scheduler_tests {
             server_nonce,
         };
         let allocation = scheduler
-            .alloc_job(&requester, toolchain(), command_hash(0), Duration::ZERO)
+            .alloc_job(
+                &requester,
+                toolchain(),
+                command_hash(0),
+                JobMemoryHints::default(),
+                Duration::ZERO,
+            )
             .unwrap();
 
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
@@ -1817,13 +1872,11 @@ mod scheduler_tests {
     const GIBIBYTE: u64 = 1024 * 1024 * 1024;
     const MEBIBYTE: u64 = 1024 * 1024;
 
-    fn create_scheduler_with_worst_case_memory_usage(
-        assumed_worst_case_memory_usage: u64,
-    ) -> Scheduler {
-        Scheduler::new(
-            MemoryMeasurements::new(100),
+    fn memory_intensive(assumed_worst_case_memory_usage: u64) -> JobMemoryHints {
+        JobMemoryHints {
+            is_potentially_memory_intensive: true,
             assumed_worst_case_memory_usage,
-        )
+        }
     }
 
     fn create_builder_info_with_available_memory(
@@ -1880,7 +1933,7 @@ mod scheduler_tests {
         }
     }
 
-    fn complete(scheduler: &Scheduler, job_alloc: &JobAlloc, peak_memory: Option<u64>) {
+    fn complete_job(scheduler: &Scheduler, job_alloc: &JobAlloc, peak_memory: Option<u64>) {
         start(scheduler, job_alloc);
         scheduler
             .handle_complete_job(job_alloc.job_id, job_alloc.server_id, peak_memory)
@@ -1889,7 +1942,8 @@ mod scheduler_tests {
 
     #[test]
     fn jobs_getting_assigned_within_memory_limits() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -1901,9 +1955,17 @@ mod scheduler_tests {
 
         // each job estimated at the worst case of 1GB
         for number in 0..3 {
-            unwrap_job_allocation(allocate_command(&scheduler, command_hash(number)));
+            unwrap_job_allocation(allocate_command_with_hints(
+                &scheduler,
+                memory_hints,
+                command_hash(number),
+            ));
         }
-        expect_no_capacity(allocate_command(&scheduler, command_hash(3)));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(3),
+        ));
     }
 
     #[test]
@@ -1935,7 +1997,8 @@ mod scheduler_tests {
 
     #[test]
     fn recording_job_memory_usage_for_estimation() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -1945,22 +2008,46 @@ mod scheduler_tests {
         )
         .unwrap();
 
-        let job = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
-        complete(&scheduler, &job, Some(2 * GIBIBYTE));
+        let job = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
+        complete_job(&scheduler, &job, Some(2 * GIBIBYTE));
         let history = vec![(command_hash(1), 2 * GIBIBYTE)];
         assert_eq!(peaks_in_history(&scheduler), history);
 
-        let first = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        let first = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
         // the scheduler sees this one job with a lot of memory usage, so the expected worst case scenario
         // should be raised to 2 gibibytes and therefore another job can't be added until the first one
         // finished, expecting it may use the same amount of memory
-        expect_no_capacity(allocate_command(&scheduler, command_hash(1)));
-        expect_no_capacity(allocate_command(&scheduler, command_hash(2)));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(2),
+        ));
 
-        complete(&scheduler, &first, None);
+        complete_job(&scheduler, &first, None);
         assert_eq!(peaks_in_history(&scheduler), history);
-        unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
-        expect_no_capacity(allocate_command(&scheduler, command_hash(1)));
+        unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
     }
 
     // make sure that estimating one job doesnt drop the estimate to some small number, causing the
@@ -1968,6 +2055,7 @@ mod scheduler_tests {
     #[test]
     fn stable_resource_usage_after_very_small_job() {
         let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(8 * GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -1977,21 +2065,38 @@ mod scheduler_tests {
         )
         .unwrap();
 
-        let small = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
-        complete(&scheduler, &small, Some(20 * MEBIBYTE));
+        let small = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
+        complete_job(&scheduler, &small, Some(20 * MEBIBYTE));
 
         // 8GB each by default
         for number in 2..4 {
-            unwrap_job_allocation(allocate_command(&scheduler, command_hash(number)));
+            unwrap_job_allocation(allocate_command_with_hints(
+                &scheduler,
+                memory_hints,
+                command_hash(number),
+            ));
         }
-        expect_no_capacity(allocate_command(&scheduler, command_hash(4)));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(4),
+        ));
         // the small command is able to fit in memory still
-        unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
     }
 
     #[test]
     fn running_job_peak_memorn_affects_worst_case_memory() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(4 * GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(4 * GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
         heartbeat(
@@ -2001,7 +2106,11 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(20, 30 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        let big = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        let big = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
         start(&scheduler, &big);
         heartbeat(
             &scheduler,
@@ -2021,14 +2130,23 @@ mod scheduler_tests {
 
         // the running job needs 10GB, so do the unknown commands: 10 + 2 * 10 <= 28 + 2
         for number in 2..4 {
-            unwrap_job_allocation(allocate_command(&scheduler, command_hash(number)));
+            unwrap_job_allocation(allocate_command_with_hints(
+                &scheduler,
+                memory_hints,
+                command_hash(number),
+            ));
         }
-        expect_no_capacity(allocate_command(&scheduler, command_hash(4)));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(4),
+        ));
     }
 
     #[test]
     fn recent_completion_raises_worst_case() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -2037,18 +2155,31 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(20, 10 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        let big = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
-        complete(&scheduler, &big, Some(4 * GIBIBYTE));
+        let big = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
+        complete_job(&scheduler, &big, Some(4 * GIBIBYTE));
 
         for number in 2..4 {
-            unwrap_job_allocation(allocate_command(&scheduler, command_hash(number)));
+            unwrap_job_allocation(allocate_command_with_hints(
+                &scheduler,
+                memory_hints,
+                command_hash(number),
+            ));
         }
-        expect_no_capacity(allocate_command(&scheduler, command_hash(4)));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(4),
+        ));
     }
 
     #[test]
     fn available_memory_limits_dispatch() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
         heartbeat(
@@ -2062,9 +2193,16 @@ mod scheduler_tests {
         // some unknown commands, so they should be esimated with the assumed worst case memory usage, and should
         // be expected to exactly fill up the available 3 gibibytes
         for _ in 0..3 {
-            assert_eq!(allocate(&scheduler), Some(server_id));
+            assert_eq!(
+                allocate_with_hints(&scheduler, memory_hints),
+                Some(server_id)
+            );
         }
-        expect_no_capacity(allocate_command(&scheduler, command_hash(1)));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
 
         heartbeat(
             &scheduler,
@@ -2073,14 +2211,21 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(10, 5 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        assert_eq!(allocate(&scheduler), Some(server_id));
-        assert_eq!(allocate(&scheduler), Some(server_id));
-        assert_eq!(allocate(&scheduler), None);
+        assert_eq!(
+            allocate_with_hints(&scheduler, memory_hints),
+            Some(server_id)
+        );
+        assert_eq!(
+            allocate_with_hints(&scheduler, memory_hints),
+            Some(server_id)
+        );
+        assert_eq!(allocate_with_hints(&scheduler, memory_hints), None);
     }
 
     #[test]
     fn memory_used_by_running_jobs() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
         heartbeat(
@@ -2090,7 +2235,11 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(10, 4 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        let running = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        let running = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
         start(&scheduler, &running);
         // the running job's memory is no longer available
         heartbeat(
@@ -2110,9 +2259,12 @@ mod scheduler_tests {
         .unwrap();
 
         for _ in 0..3 {
-            assert_eq!(allocate(&scheduler), Some(server_id));
+            assert_eq!(
+                allocate_with_hints(&scheduler, memory_hints),
+                Some(server_id)
+            );
         }
-        assert_eq!(allocate(&scheduler), None);
+        assert_eq!(allocate_with_hints(&scheduler, memory_hints), None);
     }
 
     fn wait_until_allocation_is_waiting(scheduler: &Scheduler) {
@@ -2122,12 +2274,17 @@ mod scheduler_tests {
     }
     const LONG_WAIT: Duration = Duration::from_secs(60);
 
-    fn allocate_waiting(scheduler: &Scheduler, command_hash: CommandHash) -> AllocJobResult {
+    fn allocate_waiting(
+        scheduler: &Scheduler,
+        memory_hints: JobMemoryHints,
+        command_hash: CommandHash,
+    ) -> AllocJobResult {
         scheduler
             .alloc_job(
                 &DummyAlwaysAcceptStrategy,
                 toolchain(),
                 command_hash,
+                memory_hints,
                 LONG_WAIT,
             )
             .unwrap()
@@ -2135,7 +2292,8 @@ mod scheduler_tests {
 
     #[test]
     fn job_is_allocated_when_other_job_completes() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(4 * GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(4 * GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -2144,12 +2302,17 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(10, 6 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        let first = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        let first = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
 
         let second = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| allocate_waiting(&scheduler, command_hash(2)));
+            let waiter =
+                scope.spawn(|| allocate_waiting(&scheduler, memory_hints, command_hash(2)));
             wait_until_allocation_is_waiting(&scheduler);
-            complete(&scheduler, &first, None);
+            complete_job(&scheduler, &first, None);
             waiter.join().unwrap()
         });
         assert_eq!(unwrap_job_allocation(second).server_id, server_id);
@@ -2170,7 +2333,8 @@ mod scheduler_tests {
         assert_eq!(allocate(&scheduler), Some(server_id));
 
         let second = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| allocate_waiting(&scheduler, command_hash(2)));
+            let waiter = scope
+                .spawn(|| allocate_waiting(&scheduler, JobMemoryHints::default(), command_hash(2)));
             wait_until_allocation_is_waiting(&scheduler);
             heartbeat(
                 &scheduler,
@@ -2205,6 +2369,7 @@ mod scheduler_tests {
                     &DummyAlwaysAcceptStrategy,
                     toolchain(),
                     command_hash(2),
+                    JobMemoryHints::default(),
                     max_wait,
                 )
                 .unwrap(),
@@ -2214,7 +2379,8 @@ mod scheduler_tests {
 
     #[test]
     fn job_is_not_allocated_if_system_starts_using_too_much_memory() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(4 * GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(4 * GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
         heartbeat(
@@ -2224,11 +2390,16 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(10, 6 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        let first = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        let first = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
         start(&scheduler, &first);
 
         let second = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| allocate_waiting(&scheduler, command_hash(2)));
+            let waiter =
+                scope.spawn(|| allocate_waiting(&scheduler, memory_hints, command_hash(2)));
             wait_until_allocation_is_waiting(&scheduler);
             // 2GB available but job needs 4GB
             heartbeat(
@@ -2269,7 +2440,8 @@ mod scheduler_tests {
         assert_eq!(allocate(&scheduler), Some(dead_server_id));
 
         let second = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| allocate_waiting(&scheduler, command_hash(2)));
+            let waiter = scope
+                .spawn(|| allocate_waiting(&scheduler, JobMemoryHints::default(), command_hash(2)));
             wait_until_allocation_is_waiting(&scheduler);
             scheduler
                 .servers
@@ -2297,7 +2469,8 @@ mod scheduler_tests {
 
     #[test]
     fn job_too_large() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(8 * GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(8 * GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -2306,7 +2479,11 @@ mod scheduler_tests {
             create_builder_info_with_available_memory(10, 4 * GIBIBYTE, Vec::new()),
         )
         .unwrap();
-        let message = expect_failure(allocate_command(&scheduler, command_hash(1)));
+        let message = expect_failure(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
         assert!(
             message.contains("none of the 1 servers accepts jobs"),
             "{message}"
@@ -2315,7 +2492,8 @@ mod scheduler_tests {
 
     #[test]
     fn lowering_max_memory_while_running() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
         heartbeat(
@@ -2325,8 +2503,16 @@ mod scheduler_tests {
             builder_info_with_memory_limits(10, Some(4 * GIBIBYTE)),
         )
         .unwrap();
-        let first = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
-        let second = unwrap_job_allocation(allocate_command(&scheduler, command_hash(2)));
+        let first = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
+        let second = unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(2),
+        ));
 
         // lower memory limits
         heartbeat(
@@ -2337,19 +2523,23 @@ mod scheduler_tests {
         )
         .unwrap();
         // jobs still there
-        assert_eq!(allocate(&scheduler), None);
+        assert_eq!(allocate_with_hints(&scheduler, memory_hints), None);
         assert_eq!(scheduler.jobs.lock().unwrap().len(), 2);
 
         // cant try to start more, though
-        complete(&scheduler, &first, None);
-        assert_eq!(allocate(&scheduler), None);
-        complete(&scheduler, &second, None);
-        assert_eq!(allocate(&scheduler), Some(server_id));
+        complete_job(&scheduler, &first, None);
+        assert_eq!(allocate_with_hints(&scheduler, memory_hints), None);
+        complete_job(&scheduler, &second, None);
+        assert_eq!(
+            allocate_with_hints(&scheduler, memory_hints),
+            Some(server_id)
+        );
     }
 
     #[test]
     fn server_doesnt_try_to_assign_a_job_if_there_arent_enough_resources() {
         let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(8 * GIBIBYTE);
         let small: ServerId = "127.0.0.1:10501".parse().unwrap();
         let busy: ServerId = "127.0.0.2:10501".parse().unwrap();
         heartbeat(
@@ -2359,15 +2549,96 @@ mod scheduler_tests {
             builder_info_with_memory_limits(10, Some(GIBIBYTE / 2)),
         )
         .unwrap();
-        let message = expect_failure(allocate_command(&scheduler, command_hash(1)));
+        let message = expect_failure(allocate_command_with_hints(
+            &scheduler,
+            memory_hints,
+            command_hash(1),
+        ));
         assert!(
             message.contains("none of the 1 servers accepts jobs"),
             "{message}"
         );
     }
 
+    #[test]
+    fn non_memory_intensive_jobs() {
+        let scheduler = Scheduler::default();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &ServerNonce::new(),
+            BuilderInfo {
+                limits: BuilderLimits {
+                    max_jobs: 3,
+                    max_memory: Some(GIBIBYTE),
+                },
+                ..create_builder_info_with_available_memory(3, GIBIBYTE, Vec::new())
+            },
+        )
+        .unwrap();
+        let job = unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        complete_job(&scheduler, &job, Some(8 * GIBIBYTE));
+
+        for _ in 0..3 {
+            unwrap_job_allocation(allocate_command(&scheduler, command_hash(1)));
+        }
+        expect_no_capacity(allocate_command(&scheduler, command_hash(1)));
+
+        // if we say this next one is memory intensive, then it observes that the previous run,
+        // supposedly not memory intensive, took 8GB, so now it concerns itself with that. not
+        // so useful in this case, but good to have accurate esimates for the impact of smaller
+        // jobs, if a memory intensive job is in the mix and OOM needs to be avoided
+        expect_failure(allocate_command_with_hints(
+            &scheduler,
+            memory_intensive(0),
+            command_hash(1),
+        ));
+    }
+
+    #[test]
+    fn job_request_assumed_worst_case_memory_usage() {
+        let scheduler = Scheduler::default();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        heartbeat(
+            &scheduler,
+            server_id,
+            &ServerNonce::new(),
+            create_builder_info_with_available_memory(10, 10 * GIBIBYTE, Vec::new()),
+        )
+        .unwrap();
+
+        // deploy two jobs that take up 4 gibibytes
+        for number in 1..3 {
+            unwrap_job_allocation(allocate_command_with_hints(
+                &scheduler,
+                memory_intensive(4 * GIBIBYTE),
+                command_hash(number),
+            ));
+        }
+        // can't deploy another 4 as we have used 8/10
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_intensive(4 * GIBIBYTE),
+            command_hash(3),
+        ));
+        // deploy 2 more, now using 10/10
+        unwrap_job_allocation(allocate_command_with_hints(
+            &scheduler,
+            memory_intensive(2 * GIBIBYTE),
+            command_hash(4),
+        ));
+        expect_no_capacity(allocate_command_with_hints(
+            &scheduler,
+            memory_intensive(GIBIBYTE),
+            command_hash(5),
+        ));
+        unwrap_job_allocation(allocate_command(&scheduler, command_hash(6)));
+    }
+
     struct RequesterThatAllocatesDuringJobAssignment<'a> {
         scheduler: &'a Scheduler,
+        memory_hints: JobMemoryHints,
         nested_allocation: Mutex<Option<AllocJobResult>>,
     }
 
@@ -2379,8 +2650,11 @@ mod scheduler_tests {
             _toolchain: Toolchain,
             _auth: String,
         ) -> Result<AssignJobResult> {
-            *self.nested_allocation.lock().unwrap() =
-                Some(allocate_command(self.scheduler, command_hash(2)));
+            *self.nested_allocation.lock().unwrap() = Some(allocate_command_with_hints(
+                self.scheduler,
+                self.memory_hints,
+                command_hash(2),
+            ));
             Ok(AssignJobResult {
                 state: JobState::Ready,
                 need_toolchain: false,
@@ -2390,7 +2664,8 @@ mod scheduler_tests {
 
     #[test]
     fn job_not_yet_running_is_consider_as_part_of_load() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -2402,11 +2677,18 @@ mod scheduler_tests {
 
         let requester = RequesterThatAllocatesDuringJobAssignment {
             scheduler: &scheduler,
+            memory_hints,
             nested_allocation: Mutex::new(None),
         };
         let job = unwrap_job_allocation(
             scheduler
-                .alloc_job(&requester, toolchain(), command_hash(1), Duration::ZERO)
+                .alloc_job(
+                    &requester,
+                    toolchain(),
+                    command_hash(1),
+                    memory_hints,
+                    Duration::ZERO,
+                )
                 .unwrap(),
         );
         expect_no_capacity(requester.nested_allocation.lock().unwrap().take().unwrap());
@@ -2432,7 +2714,8 @@ mod scheduler_tests {
 
     #[test]
     fn job_which_failed_to_be_assigned_is_not_considered_as_part_of_load() {
-        let scheduler = create_scheduler_with_worst_case_memory_usage(GIBIBYTE);
+        let scheduler = Scheduler::default();
+        let memory_hints = memory_intensive(GIBIBYTE);
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         heartbeat(
             &scheduler,
@@ -2444,12 +2727,21 @@ mod scheduler_tests {
 
         assert!(
             scheduler
-                .alloc_job(&FailAssign, toolchain(), command_hash(1), Duration::ZERO)
+                .alloc_job(
+                    &FailAssign,
+                    toolchain(),
+                    command_hash(1),
+                    JobMemoryHints::default(),
+                    Duration::ZERO,
+                )
                 .is_err()
         );
         assert!(scheduler.jobs.lock().unwrap().is_empty());
         // allocation can work on errored server if it's the only available one
-        assert_eq!(allocate(&scheduler), Some(server_id));
+        assert_eq!(
+            allocate_with_hints(&scheduler, memory_hints),
+            Some(server_id)
+        );
     }
 
     #[test]

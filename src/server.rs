@@ -160,6 +160,7 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
+    memory_hints: dist::JobMemoryHints,
 }
 
 #[cfg(feature = "dist-client")]
@@ -216,6 +217,10 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
+            memory_hints: dist::JobMemoryHints {
+                is_potentially_memory_intensive: config.dist.requested_jobs_may_be_memory_intensive,
+                assumed_worst_case_memory_usage: config.dist.assumed_worst_case_memory_usage,
+            },
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -382,6 +387,7 @@ impl DistClientContainer {
                     &config.toolchains,
                     auth_token,
                     config.rewrite_includes_only,
+                    config.memory_hints,
                 );
                 let dist_client =
                     try_or_retry_later!(dist_client.context("failure during dist client creation"));
@@ -1097,6 +1103,7 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
+                    memory_hints: dist::JobMemoryHints::default(),
                 }),
                 dist_client,
             ))),
@@ -2607,6 +2614,7 @@ mod tests {
             toolchain_cache_size: 0,
             toolchains: vec![],
             rewrite_includes_only: false,
+            memory_hints: dist::JobMemoryHints::default(),
         };
         let container = DistClientContainer::new_with_state(DistClientState::RetryCreateAt(
             Box::new(config),

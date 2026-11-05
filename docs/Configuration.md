@@ -45,6 +45,13 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 # (see Distributed.md, Changing max_jobs and max_memory at runtime)
 # default value is 127.0.0.1:10502
 # dist_control_address = "127.0.0.1:10502"
+# whether the scheduler should limit jobs requested by this client by memory
+# usage (see Distributed.md, Memory limits). default false
+# requested_jobs_may_be_memory_intensive = false
+# the amount of memory a memory intensive job is expected to use, if the
+# scheduler has not run it in the past and already measured its memory usage.
+# default value is 0
+# assumed_worst_case_memory_usage = "8G"
 
 [dist.auth]
 type = "token"
@@ -195,6 +202,8 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths will cause an error and prevent the server from start.
 * `SCCACHE_CACHED_CONF`
 * `SCCACHE_DIST_CLIENT_CACHE_DIR` distributed toolchain cache directory; overrides `[dist].cache_dir` from the configuration file.
+* `SCCACHE_REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE` overrides `[dist].requested_jobs_may_be_memory_intensive` for distributed jobs. It is read from the environment of each compilation, not the sccache server's, so it does not need a server restart.
+* `SCCACHE_ASSUMED_WORST_CASE_MEMORY_USAGE_FOR_REQUESTED_JOBS` overrides `[dist].assumed_worst_case_memory_usage`, for example `8G`. It is read from the environment of each compilation like the variable above.
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently
 * `SCCACHE_STARTUP_NOTIFY` specify a path to a socket which will be used for server completion notification
 * `SCCACHE_MAX_FRAME_LENGTH` how much data can be transferred between client and server

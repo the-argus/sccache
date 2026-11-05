@@ -432,6 +432,10 @@ fn test_dist_max_memory_via_dist_control() {
     let mut sccache_config =
         dist_test_sccache_client_cfg(temporary_directory, system.scheduler_url());
     sccache_config.dist.dist_control_address = server_handle.dist_control_address();
+    // use a low number so that the available memory of the machine (probably) doesn't come into
+    // play. TODO: get memavailable and assert this somewhere
+    sccache_config.dist.requested_jobs_may_be_memory_intensive = true;
+    sccache_config.dist.assumed_worst_case_memory_usage = 1024 * 1024 * 1024;
     let sccache_config_path = temporary_directory.join("sccache-cfg.json");
     write_json_cfg(temporary_directory, "sccache-cfg.json", &sccache_config);
     let sccache_cached_config_path = temporary_directory.join("sccache-cached-cfg");
@@ -441,7 +445,7 @@ fn test_dist_max_memory_via_dist_control() {
 
     const HALF_GIBIBYTE: u64 = 512 * 1024 * 1024;
 
-    // this scheduler assumed 1GB worst case, which is too much
+    // this client assumes 1GB worst case, which is too much
     set_builder_max_memory(&system, &sccache_config_path, "512M", Some(HALF_GIBIBYTE));
     basic_compile(
         temporary_directory,

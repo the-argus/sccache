@@ -303,9 +303,6 @@ public_addr = "127.0.0.1:10600"
 # max commands to remember in the memory usage history file. default is 100,000
 # which translates to about a 1MB file
 #memory_history_max_entries = 100000
-# amount of memory that sccache assumes a compilation will take if it's never
-# seen it before
-#assumed_worst_case_memory_usage = "8G"
 
 [client_auth]
 type = "token"
@@ -516,23 +513,45 @@ all builders.
 
 #### Memory limits
 
-The scheduler estimates the peak memory of every job and only assigns a job to
-a builder if it is estimated to be less than the builder's available memory.
-This is in addition to the `max_jobs` limit. The memory values are not
-enforced, however, so if a job uses much more than expected it can still cause
-OOM and it won't be killed. It's advisable to use something like cgroup memory
-limits or earlyoom to get better guarantees.
+Limiting job dispatching based on memory usage is normally disabled, and the
+scheduler dispatches based on how many cores are available. This makes the
+assumption that there is more memory available on every machine than there are
+cores, given the average amount of memory used per job. This is a pretty safe
+bet most of the time. But that is not always correct. For example, a
+distributed build network may include a system with 32GB memory and 32 threads.
+That means that if anyone dispatches a job where some jobs take >= 1GB of
+memory, the scheduler needs to start limiting by memory usage and generally
+being less aggressive with its scheduling algorithm. For a client to say
+"please use the memory-saving conservative algorithm", it can include the
+following in its client config:
+
+```toml
+[dist]
+requested_jobs_may_be_memory_intensive = true # false by default
+assumed_worst_case_memory_usage = "8G" # higher number means more conservative scheduling
+```
+
+These can be determined on a per-invocation or per-build basis by setting the
+`SCCACHE_REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE` and
+`SCCACHE_ASSUMED_WORST_CASE_MEMORY_USAGE_FOR_REQUESTED_JOBS` environment
+variables to the same values.
+
+Note that any memory limits are not strictly enforced, however, so if a job
+uses much more memory than expected it can still cause OOM and it won't be
+killed. It's advisable to use something like cgroup memory limits or earlyoom
+to get better guarantees.
 
 Memory usage is estimated as follows:
 
 1. the peak memory last measured for the same compile command
 2. otherwise the worst case, which is the largest of
-   - `assumed_worst_case_memory_usage` from the scheduler config (default 8GB)
+   - `assumed_worst_case_memory_usage` sent by the client with the job
    - the peak memory so far of any job that is currently running
    - the peak memory of any job that completed in the last 10 minutes
 
 `max_memory` is the config option which limits the sum of the estimates of the
-jobs assigned to a builder. It is unlimited by default.
+jobs assigned to a builder. It is unlimited by default. Jobs which are not
+memory intensive are estimated to take 0 bytes.
 
 Note also that a build server which doesn't report its available memory (maybe
 it doesn't have sufficient permissions or is running in docker rather than

@@ -549,6 +549,22 @@ impl fmt::Display for OutputDataLens {
 
 // AllocJob
 
+/// Hints given by the sccache client requesting jobs to say whether to limit
+/// job scheduling by memory, and if so, how conservative to be
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobMemoryHints {
+    // this will enable limiting job dispatching based on memory
+    // NOTE: it might make sense to just set assumed_worst_case_memory_usage to 0 to achieve the
+    // same thing, except part of memory usage estimations is to assume new jobs might use as much
+    // memory as the most recent dispatched job by any server, which is done to be as conservative
+    // as possible.
+    // TODO: consider removing the estimation where we look at the largest recent job, so that we
+    // don't need this option at all
+    pub is_potentially_memory_intensive: bool,
+    pub assumed_worst_case_memory_usage: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobAlloc {
@@ -763,6 +779,7 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
         command_hash: CommandHash,
+        memory_hints: JobMemoryHints,
     ) -> ExtResult<AllocJobResult, Error>;
     // From Server
     fn handle_heartbeat_server(
@@ -837,6 +854,7 @@ pub trait Client: Send + Sync {
         &self,
         tc: Toolchain,
         command_hash: CommandHash,
+        memory_hints: JobMemoryHints,
     ) -> Result<AllocJobResult>;
     // To Scheduler
     async fn do_get_status(&self) -> Result<SchedulerStatusResult>;
@@ -861,5 +879,6 @@ pub trait Client: Send + Sync {
         toolchain_packager: Box<dyn pkg::ToolchainPackager>,
     ) -> Result<(Toolchain, Option<(String, PathBuf)>)>;
     fn rewrite_includes_only(&self) -> bool;
+    fn memory_hints(&self) -> JobMemoryHints;
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

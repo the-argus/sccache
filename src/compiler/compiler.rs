@@ -942,12 +942,16 @@ where
     debug!("[{}]: Attempting distributed compilation", out_pretty);
     let out_pretty2 = out_pretty.clone();
 
+    let memory_hints =
+        update_memory_hints_from_env_vars(dist_client.memory_hints(), &compile_cmd.get_env_vars());
+
     let local_executable = compile_cmd.get_executable();
     let local_executable2 = compile_cmd.get_executable();
 
     let do_dist_compile = async move {
         let mut dist_compile_cmd =
             dist_compile_cmd.context("Could not create distributed compile command")?;
+        let memory_hints = memory_hints?;
         debug!("[{}]: Creating distributed compile request", out_pretty);
         let dist_output_paths = compilation
             .outputs()
@@ -974,7 +978,7 @@ where
         debug!("[{}]: Requesting allocation", out_pretty);
         let job_alloc = loop {
             break match dist_client
-                .do_alloc_job(dist_toolchain.clone(), command_hash.clone())
+                .do_alloc_job(dist_toolchain.clone(), command_hash.clone(), memory_hints)
                 .await?
             {
                 dist::AllocJobResult::Success {
@@ -1142,6 +1146,41 @@ where
         })
         .map_ok(move |(dt, o)| (cacheable, dt, o))
         .await
+}
+
+#[cfg(feature = "dist-client")]
+const REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE_ENV_VAR: &str =
+    "SCCACHE_REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE";
+#[cfg(feature = "dist-client")]
+const ASSUMED_WORST_CASE_MEMORY_USAGE_ENV_VAR: &str =
+    "SCCACHE_ASSUMED_WORST_CASE_MEMORY_USAGE_FOR_REQUESTED_JOBS";
+
+#[cfg(feature = "dist-client")]
+fn update_memory_hints_from_env_vars(
+    mut memory_hints: dist::JobMemoryHints,
+    env_vars: &[(OsString, OsString)],
+) -> Result<dist::JobMemoryHints> {
+    for (name, value) in env_vars {
+        let value = value.to_string_lossy();
+        if value.is_empty() {
+            continue;
+        }
+        if name == REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE_ENV_VAR {
+            memory_hints.is_potentially_memory_intensive = crate::config::parse_env_var_bool(
+                REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE_ENV_VAR,
+                &value,
+            )?;
+        } else if name == ASSUMED_WORST_CASE_MEMORY_USAGE_ENV_VAR {
+            memory_hints.assumed_worst_case_memory_usage = crate::config::parse_size(&value)
+                .with_context(|| {
+                    format!(
+                        "{} must be a size such as 8G, not {:?}",
+                        ASSUMED_WORST_CASE_MEMORY_USAGE_ENV_VAR, value
+                    )
+                })?;
+        }
+    }
+    Ok(memory_hints)
 }
 
 impl<T: CommandCreatorSync> Clone for Box<dyn CompilerHasher<T>> {
@@ -3887,6 +3926,60 @@ mod test_dist {
 
     use crate::errors::*;
 
+    #[test]
+    fn get_memory_hints_from_requesting_client_env_vars() {
+        let config = dist::JobMemoryHints {
+            is_potentially_memory_intensive: true,
+            assumed_worst_case_memory_usage: 1024,
+        };
+        let env_vars = |vars: &[(&str, &str)]| -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+            vars.iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect()
+        };
+        assert_eq!(
+            super::update_memory_hints_from_env_vars(config, &env_vars(&[("PATH", "/usr/bin")]))
+                .unwrap(),
+            config
+        );
+        assert_eq!(
+            super::update_memory_hints_from_env_vars(
+                config,
+                &env_vars(&[
+                    ("SCCACHE_REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE", "off"),
+                    (
+                        "SCCACHE_ASSUMED_WORST_CASE_MEMORY_USAGE_FOR_REQUESTED_JOBS",
+                        "8G"
+                    ),
+                ])
+            )
+            .unwrap(),
+            dist::JobMemoryHints {
+                is_potentially_memory_intensive: false,
+                assumed_worst_case_memory_usage: 8 * 1024 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            super::update_memory_hints_from_env_vars(
+                config,
+                &env_vars(&[("SCCACHE_REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE", "")])
+            )
+            .unwrap(),
+            config
+        );
+        for invalid in [
+            ("SCCACHE_REQUESTED_JOBS_MAY_BE_MEMORY_INTENSIVE", "maybe"),
+            (
+                "SCCACHE_ASSUMED_WORST_CASE_MEMORY_USAGE_FOR_REQUESTED_JOBS",
+                "lots",
+            ),
+        ] {
+            assert!(
+                super::update_memory_hints_from_env_vars(config, &env_vars(&[invalid])).is_err()
+            );
+        }
+    }
+
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
         #[allow(clippy::new_ret_no_self)]
@@ -3896,7 +3989,12 @@ mod test_dist {
     }
     #[async_trait]
     impl dist::Client for ErrorPutToolchainClient {
-        async fn do_alloc_job(&self, _: Toolchain, _: dist::CommandHash) -> Result<AllocJobResult> {
+        async fn do_alloc_job(
+            &self,
+            _: Toolchain,
+            _: dist::CommandHash,
+            _: dist::JobMemoryHints,
+        ) -> Result<AllocJobResult> {
             unreachable!()
         }
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
@@ -3929,6 +4027,9 @@ mod test_dist {
         fn rewrite_includes_only(&self) -> bool {
             false
         }
+        fn memory_hints(&self) -> dist::JobMemoryHints {
+            dist::JobMemoryHints::default()
+        }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }
@@ -3953,6 +4054,7 @@ mod test_dist {
             &self,
             tc: Toolchain,
             _: dist::CommandHash,
+            _: dist::JobMemoryHints,
         ) -> Result<AllocJobResult> {
             assert_eq!(self.tc, tc);
             Err(anyhow!("MOCK: alloc job failure"))
@@ -3987,6 +4089,9 @@ mod test_dist {
         fn rewrite_includes_only(&self) -> bool {
             false
         }
+        fn memory_hints(&self) -> dist::JobMemoryHints {
+            dist::JobMemoryHints::default()
+        }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }
@@ -4014,6 +4119,7 @@ mod test_dist {
             &self,
             tc: Toolchain,
             _: dist::CommandHash,
+            _: dist::JobMemoryHints,
         ) -> Result<AllocJobResult> {
             assert!(
                 !self
@@ -4062,6 +4168,9 @@ mod test_dist {
         fn rewrite_includes_only(&self) -> bool {
             false
         }
+        fn memory_hints(&self) -> dist::JobMemoryHints {
+            dist::JobMemoryHints::default()
+        }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }
@@ -4089,6 +4198,7 @@ mod test_dist {
             &self,
             tc: Toolchain,
             _: dist::CommandHash,
+            _: dist::JobMemoryHints,
         ) -> Result<AllocJobResult> {
             assert!(
                 !self
@@ -4145,6 +4255,9 @@ mod test_dist {
         fn rewrite_includes_only(&self) -> bool {
             false
         }
+        fn memory_hints(&self) -> dist::JobMemoryHints {
+            dist::JobMemoryHints::default()
+        }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }
@@ -4188,6 +4301,7 @@ mod test_dist {
             &self,
             tc: Toolchain,
             _: dist::CommandHash,
+            _: dist::JobMemoryHints,
         ) -> Result<AllocJobResult> {
             if self
                 .num_no_available_resources_replies_remaining
@@ -4271,6 +4385,9 @@ mod test_dist {
         }
         fn rewrite_includes_only(&self) -> bool {
             false
+        }
+        fn memory_hints(&self) -> dist::JobMemoryHints {
+            dist::JobMemoryHints::default()
         }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None

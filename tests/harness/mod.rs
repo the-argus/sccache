@@ -193,6 +193,8 @@ pub fn sccache_client_cfg(
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
             dist_control_address: sccache::config::DEFAULT_DIST_CONTROL_ADDRESS,
+            requested_jobs_may_be_memory_intensive: false,
+            assumed_worst_case_memory_usage: 0,
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
@@ -212,9 +214,6 @@ fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
             .join("scheduler-memory-history.json"),
         memory_history_max_entries: sccache::config::scheduler::default_memory_history_max_entries(
         ),
-        // generally use low numbers so that memavailable of machine (probably) doesn't come into
-        // play. TODO: get memavailable and assert this somewhere
-        assumed_worst_case_memory_usage: 1024 * 1024 * 1024,
     }
 }
 

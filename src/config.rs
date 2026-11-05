@@ -786,6 +786,9 @@ pub struct DistConfig {
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
     pub dist_control_address: std::net::SocketAddr,
+    pub requested_jobs_may_be_memory_intensive: bool,
+    #[serde(deserialize_with = "deserialize_size_from_str")]
+    pub assumed_worst_case_memory_usage: u64,
 }
 
 impl Default for DistConfig {
@@ -798,6 +801,8 @@ impl Default for DistConfig {
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
             dist_control_address: DEFAULT_DIST_CONTROL_ADDRESS,
+            requested_jobs_may_be_memory_intensive: false,
+            assumed_worst_case_memory_usage: 0,
         }
     }
 }
@@ -893,15 +898,19 @@ where
 
 fn bool_from_env_var(env_var_name: &str) -> Result<Option<bool>> {
     string_from_env_var(env_var_name)
-        .map(|value| match value.to_lowercase().as_str() {
-            "true" | "on" | "1" => Ok(true),
-            "false" | "off" | "0" => Ok(false),
-            _ => bail!(
-                "{} must be 'true', 'on', '1', 'false', 'off' or '0'.",
-                env_var_name
-            ),
-        })
+        .map(|value| parse_env_var_bool(env_var_name, &value))
         .transpose()
+}
+
+pub fn parse_env_var_bool(env_var_name: &str, value: &str) -> Result<bool> {
+    match value.to_lowercase().as_str() {
+        "true" | "on" | "1" => Ok(true),
+        "false" | "off" | "0" => Ok(false),
+        _ => bail!(
+            "{} must be 'true', 'on', '1', 'false', 'off' or '0'.",
+            env_var_name
+        ),
+    }
 }
 
 fn skip_cache_check_from_env() -> Result<bool> {
@@ -1590,10 +1599,6 @@ pub mod scheduler {
         100_000
     }
 
-    pub fn default_assumed_worst_case_memory_usage() -> u64 {
-        8 * 1024 * 1024 * 1024
-    }
-
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
@@ -1604,11 +1609,6 @@ pub mod scheduler {
         pub memory_history_path: PathBuf,
         #[serde(default = "default_memory_history_max_entries")]
         pub memory_history_max_entries: usize,
-        #[serde(
-            default = "default_assumed_worst_case_memory_usage",
-            deserialize_with = "super::deserialize_size_from_str"
-        )]
-        pub assumed_worst_case_memory_usage: u64,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3113,6 +3113,8 @@ key_prefix = "cosprefix"
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
                 dist_control_address: "127.0.0.1:20502".parse().unwrap(),
+                requested_jobs_may_be_memory_intensive: false,
+                assumed_worst_case_memory_usage: 0,
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3302,40 +3304,30 @@ fn scheduler_toml_parse_memory_history() {
 }
 
 #[test]
-#[cfg(feature = "dist-server")]
-fn scheduler_toml_parse_assumed_worst_case_memory_usage() {
-    const CONFIG_STR: &str = r#"
-    public_addr = "127.0.0.1:10600"
-
-    [client_auth]
-    type = "DANGEROUSLY_INSECURE"
-
-    [server_auth]
-    type = "DANGEROUSLY_INSECURE"
-    "#;
-    let parse = |line: &str| -> u64 {
-        let scheduler_config: scheduler::Config =
-            toml::from_str(&format!("{line}\n{CONFIG_STR}")).unwrap();
-        scheduler_config.assumed_worst_case_memory_usage
+fn dist_toml_parse_memory_hints() {
+    let parse = |dist_section: &str| -> DistConfig {
+        toml::from_str::<FileConfig>(&format!("[dist]\n{dist_section}"))
+            .unwrap()
+            .dist
     };
-    assert_eq!(parse(""), 8 * 1024 * 1024 * 1024);
+    let dist_config = parse("");
+    assert!(!dist_config.requested_jobs_may_be_memory_intensive);
+    assert_eq!(dist_config.assumed_worst_case_memory_usage, 0);
+
+    let dist_config = parse(
+        "requested_jobs_may_be_memory_intensive = true\nassumed_worst_case_memory_usage = \"16G\"",
+    );
+    assert!(dist_config.requested_jobs_may_be_memory_intensive);
     assert_eq!(
-        parse(r#"assumed_worst_case_memory_usage = "16G""#),
+        dist_config.assumed_worst_case_memory_usage,
         16 * 1024 * 1024 * 1024
     );
     assert_eq!(
-        parse(r#"assumed_worst_case_memory_usage = "512M""#),
-        512 * 1024 * 1024
-    );
-    assert_eq!(
-        parse("assumed_worst_case_memory_usage = 1048576"),
+        parse("assumed_worst_case_memory_usage = 1048576").assumed_worst_case_memory_usage,
         1024 * 1024
     );
     assert!(
-        toml::from_str::<scheduler::Config>(&format!(
-            "assumed_worst_case_memory_usage = \"lots\"\n{CONFIG_STR}"
-        ))
-        .is_err()
+        toml::from_str::<FileConfig>("[dist]\nassumed_worst_case_memory_usage = \"lots\"").is_err()
     );
 }
 

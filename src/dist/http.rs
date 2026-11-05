@@ -92,11 +92,13 @@ mod common {
         }
     }
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
+    #[derive(Clone, Debug, Serialize)]
     pub struct AllocJobHttpRequest {
         pub toolchain: dist::Toolchain,
         pub command_hash: dist::CommandHash,
+        // note that we accept requests which don't contain memory_hints, for backwards
+        // compatibility. so new fields must be added at the end of this struct
+        pub memory_hints: dist::JobMemoryHints,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -494,6 +496,13 @@ mod server {
     where
         O: serde::de::DeserializeOwned,
     {
+        bincode_input_with(request, |body| bincode::deserialize_from(body))
+    }
+
+    fn bincode_input_with<O>(
+        request: &rouille::Request,
+        decode: impl FnOnce(&mut dyn Read) -> bincode::Result<O>,
+    ) -> std::result::Result<O, RouilleBincodeError> {
         if let Some(header) = request.header("Content-Type") {
             if !header.starts_with("application/octet-stream") {
                 return Err(RouilleBincodeError::WrongContentType);
@@ -503,10 +512,31 @@ mod server {
         }
 
         if let Some(mut b) = request.data() {
-            bincode::deserialize_from::<_, O>(&mut b).map_err(From::from)
+            decode(&mut b).map_err(From::from)
         } else {
             Err(RouilleBincodeError::BodyAlreadyExtracted)
         }
+    }
+
+    fn alloc_job_http_request_input(
+        request: &rouille::Request,
+    ) -> std::result::Result<AllocJobHttpRequest, RouilleBincodeError> {
+        bincode_input_with(request, |body| {
+            let toolchain = bincode::deserialize_from(&mut *body)?;
+            let command_hash = bincode::deserialize_from(&mut *body)?;
+            let mut memory_hints = Vec::new();
+            body.read_to_end(&mut memory_hints)?;
+            let memory_hints = if memory_hints.is_empty() {
+                dist::JobMemoryHints::default()
+            } else {
+                bincode::deserialize(&memory_hints)?
+            };
+            Ok(AllocJobHttpRequest {
+                toolchain,
+                command_hash,
+                memory_hints,
+            })
+        })
     }
 
     // Based on try_or_400 in rouille, but with logging
@@ -879,10 +909,10 @@ mod server {
                                 return make_401_with_body("bearer_auth_failed", client_msg)
                             },
                         }
-                        let AllocJobHttpRequest { toolchain, command_hash } = try_or_400_log!(req_id, bincode_input(request));
-                        trace!("Req {}: alloc_job: {:?} {:?}", req_id, toolchain, command_hash);
+                        let AllocJobHttpRequest { toolchain, command_hash, memory_hints } = try_or_400_log!(req_id, alloc_job_http_request_input(request));
+                        trace!("Req {}: alloc_job: {:?} {:?} {:?}", req_id, toolchain, command_hash, memory_hints);
 
-                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester, toolchain, command_hash));
+                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester, toolchain, command_hash, memory_hints));
                         let certs = server_certificates.lock().unwrap();
                         let res = AllocJobHttpResponse::from_alloc_job_result(alloc_job_res, &certs);
                         prepare_response(request, &res)
@@ -1673,7 +1703,7 @@ MemAvailable:   40000000 kB
     #[cfg(test)]
     #[derive(Default)]
     struct RecordingScheduler {
-        allocations: Mutex<Vec<dist::CommandHash>>,
+        allocations: Mutex<Vec<(dist::CommandHash, dist::JobMemoryHints)>>,
         state_updates: Mutex<Vec<(JobId, ServerId, JobState)>>,
         completions: Mutex<Vec<(JobId, ServerId, Option<u64>)>>,
     }
@@ -1685,9 +1715,13 @@ MemAvailable:   40000000 kB
             _requester: &dyn dist::SchedulerOutgoing,
             _toolchain: Toolchain,
             command_hash: dist::CommandHash,
+            memory_hints: dist::JobMemoryHints,
         ) -> Result<AllocJobResult> {
             let no_capacity = command_hash == no_capacity_command_hash();
-            self.allocations.lock().unwrap().push(command_hash);
+            self.allocations
+                .lock()
+                .unwrap()
+                .push((command_hash, memory_hints));
             if no_capacity {
                 return Ok(AllocJobResult::NoCapacity);
             }
@@ -1802,9 +1836,14 @@ MemAvailable:   40000000 kB
     fn scheduler_allocation_with_command_hash() {
         let router = recording_router();
         let client: SocketAddr = "192.0.2.7:40000".parse().unwrap();
+        let memory_hints = dist::JobMemoryHints {
+            is_potentially_memory_intensive: true,
+            assumed_worst_case_memory_usage: 1 << 33,
+        };
         let body = bincode::serialize(&AllocJobHttpRequest {
             toolchain: test_toolchain(),
             command_hash: test_command_hash(),
+            memory_hints,
         })
         .unwrap();
         let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
@@ -1815,14 +1854,25 @@ MemAvailable:   40000000 kB
         assert!(matches!(response, AllocJobHttpResponse::Fail { .. }));
         assert_eq!(
             *router.handler.allocations.lock().unwrap(),
-            vec![test_command_hash()]
+            vec![(test_command_hash(), memory_hints)]
+        );
+
+        // test backwards compatibility, this request does not include the new(er) memory_hints
+        // field
+        let mut body = bincode::serialize(&test_toolchain()).unwrap();
+        body.extend(bincode::serialize(&test_command_hash()).unwrap());
+        let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
+        assert_eq!(router.respond(1, &request).status_code, 200);
+        assert_eq!(
+            router.handler.allocations.lock().unwrap()[1],
+            (test_command_hash(), dist::JobMemoryHints::default())
         );
 
         // The request body before the command hash was added
         let body = bincode::serialize(&test_toolchain()).unwrap();
         let request = bincode_post(client, "/api/v1/scheduler/alloc_job", "client", body);
-        assert_eq!(router.respond(1, &request).status_code, 400);
-        assert_eq!(router.handler.allocations.lock().unwrap().len(), 1);
+        assert_eq!(router.respond(2, &request).status_code, 400);
+        assert_eq!(router.handler.allocations.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1938,19 +1988,31 @@ MemAvailable:   40000000 kB
             &[],
             "client token".to_owned(),
             false,
+            dist::JobMemoryHints::default(),
         )
         .unwrap();
+        let memory_hints = dist::JobMemoryHints {
+            is_potentially_memory_intensive: true,
+            assumed_worst_case_memory_usage: 1024,
+        };
         let result = runtime
-            .block_on(client.do_alloc_job(test_toolchain(), test_command_hash()))
+            .block_on(client.do_alloc_job(test_toolchain(), test_command_hash(), memory_hints))
             .unwrap();
         assert!(matches!(result, AllocJobResult::Fail { .. }));
         let result = runtime
-            .block_on(client.do_alloc_job(test_toolchain(), no_capacity_command_hash()))
+            .block_on(client.do_alloc_job(
+                test_toolchain(),
+                no_capacity_command_hash(),
+                dist::JobMemoryHints::default(),
+            ))
             .unwrap();
         assert!(matches!(result, AllocJobResult::NoCapacity));
         assert_eq!(
             *router.handler.allocations.lock().unwrap(),
-            vec![test_command_hash(), no_capacity_command_hash()]
+            vec![
+                (test_command_hash(), memory_hints),
+                (no_capacity_command_hash(), dist::JobMemoryHints::default())
+            ]
         );
     }
 
@@ -2079,6 +2141,7 @@ mod client {
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
+        memory_hints: dist::JobMemoryHints,
     }
 
     impl Client {
@@ -2091,6 +2154,7 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
+            memory_hints: dist::JobMemoryHints,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
@@ -2113,6 +2177,7 @@ mod client {
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
+                memory_hints,
             })
         }
 
@@ -2154,6 +2219,7 @@ mod client {
             &self,
             tc: Toolchain,
             command_hash: CommandHash,
+            memory_hints: dist::JobMemoryHints,
         ) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_alloc_job(&scheduler_url);
@@ -2163,6 +2229,7 @@ mod client {
                 .bincode(&AllocJobHttpRequest {
                     toolchain: tc,
                     command_hash,
+                    memory_hints,
                 })?;
 
             let client = self.client.clone();
@@ -2312,6 +2379,9 @@ mod client {
 
         fn rewrite_includes_only(&self) -> bool {
             self.rewrite_includes_only
+        }
+        fn memory_hints(&self) -> dist::JobMemoryHints {
+            self.memory_hints
         }
         fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
             match self.tc_cache.get_custom_toolchain(exe) {
