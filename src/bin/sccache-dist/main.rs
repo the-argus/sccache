@@ -778,7 +778,7 @@ impl Scheduler {
                     });
                 if job_is_too_large_even_if_all_other_jobs_completed {
                     let message = format!(
-                        "Job needs an estimated {} bytes of memory, which exceeds the max memory or available memory of all {} servers",
+                        "Job with an estimated peak memory of {} bytes can not be allocated: none of the {} servers accepts jobs, because of max_jobs = 0, max_memory or available memory",
                         estimated_peak_memory,
                         servers.len()
                     );
